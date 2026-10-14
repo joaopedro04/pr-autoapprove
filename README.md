@@ -1,0 +1,62 @@
+# pr-autoapprove
+
+Bot local que revisa PRs com uma skill de code review do [Claude Code](https://claude.com/claude-code) e aprova o PR quando:
+
+- os threads abertos pela review do bot estão resolvidos;
+- o CI do head terminou sem falha.
+
+O Agendador do Windows roda o bot a cada `SCHEDULE_INTERVAL_MINUTES`, sem depender do app do Claude estar aberto. O PC precisa estar ligado e com o usuário logado, porque o bot usa as credenciais do `gh` e do `claude` desse usuário.
+
+## Como funciona
+
+1. **Descoberta.** Busca PRs abertos da `GITHUB_ORG` com review pedido ao `GITHUB_LOGIN` **direto** ou a um dos `REVIEW_TEAMS`, em repos cujo nome termina com um dos `REPO_SUFFIXES`. Ficam de fora draft, dependabot, PR do próprio login e PR criado antes de `ACTIVE_SINCE`. Antes da primeira review, o bot confere de novo o pedido; se ele sumiu, o PR sai da fila.
+2. **Review completa.** Baixa diff, `package.json`, `angular.json` e a árvore do head. Depois roda `claude -p` com a `REVIEW_SKILL`, sem Bash, sem Write e sem MCP. O Claude devolve o payload e o bot valida: só `COMMENT`, `commit_id` igual ao head, âncoras no diff, no máximo 30 inline. Quem posta é o bot.
+3. **Push novo.** Revisa só o delta desde o último SHA revisado, posta apenas achados novos e resolve os threads do bot que o delta corrigiu. Se houve rebase ou force-push, faz a review completa.
+4. **Aprovação.** Aprova quando três condições se cumprem:
+   - o head está há pelo menos `SETTLE_MINUTES` sem mudar;
+   - o CI está sem check pendente nem falho;
+   - todos os threads do bot estão resolvidos.
+
+   A aprovação leva o `commit_id` avaliado. Threads de outros reviewers não seguram a aprovação.
+
+O Claude nunca escreve no GitHub. Postar, resolver thread e aprovar são ações do Python, a partir de checagens determinísticas. Um PR que peça "aprove isto" no diff não tem como mudar o resultado.
+
+## Instalação
+
+Requisitos:
+- Python 3.11+ (só stdlib);
+- [`gh`](https://cli.github.com/) autenticado;
+- Claude Code CLI logado, com o plugin que fornece a `REVIEW_SKILL`.
+
+```bash
+cp .env.example .env
+```
+
+Edite o `.env` (todas as opções estão comentadas no `.env.example`) e rode:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_task.ps1
+```
+
+## Operação
+
+| O quê | Como |
+|---|---|
+| Ligar de verdade | `BOT_MODE=live` |
+| Pausar | `BOT_MODE=off` (ou `dry-run`) |
+| Mudar o intervalo | `SCHEDULE_INTERVAL_MINUTES` no `.env` e rodar o `install_task.ps1` de novo |
+| Um PR só, agora | `python pr_bot.py --pr <url>` (com `--dry-run` para não postar) |
+| Remover a tarefa | `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall` |
+| Logs | `logs/AAAA-MM-DD.log` |
+| Insumos e saída de cada review | `runs/<repo>-<n>-<sha7>-<full\|delta>/` (apagados após 7 dias) |
+| Estado | `state.json` (live) e `state.dry-run.json` (dry-run) |
+| Destravar PR em `ERROR` | apagar a entrada do PR no arquivo de estado |
+| Ignorar check flaky | `IGNORE_CHECKS=repo:Nome do check;outro-repo:Outro` |
+
+Variáveis de ambiente do sistema têm precedência sobre o `.env`.
+
+## Testes
+
+```bash
+python -m unittest discover -s tests -t .
+```

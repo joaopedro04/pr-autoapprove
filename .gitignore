@@ -1,0 +1,7 @@
+state*.json
+state.lock
+state.tmp
+logs/
+runs/
+__pycache__/
+.env
