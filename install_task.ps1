@@ -17,10 +17,17 @@ if (Test-Path $envFile) {
 }
 
 $taskName = if ($envVars['SCHEDULE_TASK_NAME']) { $envVars['SCHEDULE_TASK_NAME'] } else { 'pr-autoapprove' }
+$dashTask = "$taskName-dashboard"
+$port = if ($envVars['DASHBOARD_PORT']) { $envVars['DASHBOARD_PORT'] } else { '8765' }
 
 if ($Uninstall) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host "Tarefa $taskName removida."
+    foreach ($name in @($taskName, $dashTask)) {
+        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false
+            Write-Host "Tarefa $name removida."
+        }
+    }
     return
 }
 
@@ -47,5 +54,22 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Se
     -Description 'Revisa PRs com uma skill do Claude Code e aprova quando os threads do bot estão resolvidos e o CI está verde.' `
     -Force | Out-Null
 
+Stop-ScheduledTask -TaskName $dashTask -ErrorAction SilentlyContinue
+$dashAction = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$botDir\dashboard.py`"" -WorkingDirectory $botDir
+$dashTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$dashSettings = New-ScheduledTaskSettingsSet `
+    -MultipleInstances IgnoreNew `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+Register-ScheduledTask -TaskName $dashTask -Action $dashAction -Trigger $dashTrigger -Settings $dashSettings -Principal $principal `
+    -Description 'Painel ao vivo do pr-autoapprove em 127.0.0.1.' `
+    -Force | Out-Null
+Start-ScheduledTask -TaskName $dashTask
+
 Write-Host "Tarefa $taskName a cada $IntervalMinutes min, com $pythonw"
+Write-Host "Painel ao vivo ($dashTask): http://127.0.0.1:$port/"
 Get-ScheduledTask -TaskName $taskName | Get-ScheduledTaskInfo | Select-Object TaskName, NextRunTime

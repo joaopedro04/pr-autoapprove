@@ -18,6 +18,8 @@ BOT_DIR = Path(__file__).resolve().parent
 PR_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
 LOCK_STALE_MINUTES = 150
 RUNS_KEEP_DAYS = 7
+DONE_KEEP = 30
+REVIEWS_KEEP = 20
 
 
 def now_iso():
@@ -99,6 +101,39 @@ class Bot:
         self.login = cfg["login"]
         self.reviews_left = cfg["max_reviews_per_run"]
 
+    def save(self):
+        self.state.save()
+
+    def note(self, key, entry, msg, level=logging.INFO):
+        self.log.log(level, "%s: %s", key, msg)
+        entry["note"] = msg
+        entry["note_at"] = now_iso()
+
+    def retire(self, key, entry, reason, msg):
+        done = self.state.data.setdefault("done", [])
+        done.insert(0, {
+            "key": key, "url": entry.get("url"), "title": entry.get("title"), "author": entry.get("author"),
+            "status": entry["status"], "reason": reason, "left_at": now_iso(), "reviews": entry.get("reviews", []),
+        })
+        del done[DONE_KEEP:]
+        del self.state.prs[key]
+        self.log.info("%s: %s", key, msg)
+
+    def run_review(self, entry, kind, head, template, values, run_dir):
+        entry["activity"] = {"kind": kind, "sha": head, "started_at": now_iso()}
+        record = {"kind": kind, "sha": head, "at": now_iso(), "counts": None, "cost_usd": 0.0, "id": None}
+        reviews = entry.setdefault("reviews", [])
+        reviews.append(record)
+        del reviews[:-REVIEWS_KEEP]
+        self.save()
+        try:
+            payload = reviewer.run_claude(self.cfg, reviewer.render(template, values), run_dir, self.log)
+            record["counts"] = payload.get("counts")
+            return payload, record
+        finally:
+            record["cost_usd"] = reviewer.read_cost(run_dir)
+            entry.pop("activity", None)
+
     def discover(self):
         org = self.cfg["org"]
         filters = f"draft:false -author:app/dependabot -author:{self.login} created:>={self.cfg['active_since']}"
@@ -112,8 +147,8 @@ class Bot:
             key = f"{owner}/{repo}#{item['number']}"
             if key not in self.state.prs:
                 self.state.prs[key] = new_entry(owner, repo, item["number"], item["url"])
-                self.log.info("%s: novo PR na fila", key)
-        self.state.save()
+                self.note(key, self.state.prs[key], "entrou na fila")
+        self.save()
 
     def process_all(self, only_key=None):
         order = {"REVIEWED": 0, "APPROVED": 1, "SKIPPED": 2, "NEW": 3, "ERROR": 4}
@@ -134,36 +169,33 @@ class Bot:
                     self.log.exception("%s: erro inesperado", key)
                 if entry["failures"] >= self.cfg["max_failures"]:
                     entry["status"] = "ERROR"
-                    self.log.error("%s: marcado como ERROR depois de %d falhas seguidas", key, entry["failures"])
+                    self.note(key, entry, f"marcado como ERROR depois de {entry['failures']} falhas seguidas", logging.ERROR)
             finally:
-                self.state.save()
+                self.save()
 
     def process(self, key, entry):
         owner, repo, n = entry["owner"], entry["repo"], entry["number"]
+        entry.pop("activity", None)
         pr = self.gh.pr_view(owner, repo, n)
+        entry["title"] = pr.get("title")
+        entry["author"] = (pr.get("author") or {}).get("login")
         if pr["state"] != "OPEN":
-            del self.state.prs[key]
-            self.log.info("%s: %s, saiu da fila", key, pr["state"].lower())
-            return
+            return self.retire(key, entry, pr["state"].lower(), f"{pr['state'].lower()}, saiu da fila")
         if pr["isDraft"]:
-            self.log.info("%s: virou draft, esperando", key)
-            return
+            return self.note(key, entry, "virou draft, esperando")
         head = pr["headRefOid"]
         if entry.get("head_sha") != head:
             entry["head_sha"] = head
             entry["head_seen_at"] = now_iso()
         action = gate.next_action(entry, head)
         if action in ("full_review", "delta_review") and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
-            self.log.info("%s: head %s mudou há menos de %d min, esperando novos pushes antes de revisar", key, head[:7], self.cfg["review_debounce_minutes"])
-            return
+            return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         if (
             entry["status"] == "NEW"
             and entry.get("source", "discovery") == "discovery"
             and not self.is_requested(owner, repo, n)
         ):
-            del self.state.prs[key]
-            self.log.info("%s: review não está mais pedido a %s nem aos times %s, saiu da fila", key, self.login, self.cfg["review_teams"])
-            return
+            return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
         if action == "full_review":
             self.full_review(key, entry, pr)
         elif action == "delta_review":
@@ -189,7 +221,7 @@ class Bot:
 
     def skip(self, key, entry, head, reason):
         entry.update(status="SKIPPED", skipped_sha=head, skip_reason=reason)
-        self.log.info("%s: ignorado em %s (%s)", key, head[:7], reason)
+        self.note(key, entry, f"ignorado em {head[:7]} ({reason})")
 
     def adopt_existing_review(self, key, entry):
         mine = [
@@ -222,8 +254,7 @@ class Bot:
         if not gate.is_angular_package(self.gh.file_at(owner, repo, "package.json", head)):
             return self.skip(key, entry, head, "package.json sem @angular/core")
         if self.reviews_left <= 0:
-            self.log.info("%s: review adiada, limite da execução atingido", key)
-            return
+            return self.note(key, entry, "review adiada, limite de reviews da execução atingido")
         run_dir = self.run_dir(entry, head, "full")
         _, diff = self.load_inputs(entry, pr, run_dir)
         values = self.prompt_values(entry, pr, run_dir)
@@ -234,11 +265,11 @@ class Bot:
             values["OPEN_THREADS_SECTION"] = reviewer.OPEN_THREADS_SECTION.format(run_dir=run_dir.as_posix())
             values["FIXED_THREADS_FIELD"] = reviewer.FIXED_THREADS_FIELD
         self.reviews_left -= 1
-        self.log.info("%s: review completa em %s", key, head[:7])
-        payload = reviewer.run_claude(self.cfg, reviewer.render("full_review.md", values), run_dir, self.log)
+        self.note(key, entry, f"review completa em {head[:7]}")
+        payload, record = self.run_review(entry, "full", head, "full_review.md", values, run_dir)
         if payload.get("body", "").strip() == "Nothing to review":
             return self.skip(key, entry, head, "a skill não achou nada para revisar")
-        self.publish(key, entry, pr, payload, gate.right_lines(diff), run_dir, always=True)
+        record["id"] = self.publish(key, entry, pr, payload, gate.right_lines(diff), run_dir, always=True)
         self.close_fixed(key, payload, open_threads or [], head)
         entry.update(status="REVIEWED", reviewed_sha=head, reviewed_at=now_iso())
 
@@ -249,18 +280,17 @@ class Bot:
         open_threads = gate.open_thread_summaries(mine)
         cmp = self.gh.compare(owner, repo, base, head)
         if cmp is None or cmp["status"] in ("diverged", "behind"):
-            self.log.info("%s: histórico reescrito desde %s (%s), indo de review completa", key, base[:7], cmp and cmp["status"])
+            self.note(key, entry, f"histórico reescrito desde {base[:7]} ({cmp and cmp['status']}), indo de review completa")
             return self.full_review(key, entry, pr, open_threads)
         files = [f["filename"] for f in self.gh.pr_files(owner, repo, n)]
         delta = gate.filter_diff_to_files(self.gh.compare_diff(owner, repo, base, head), files)
         delta_files = [gate.block_path(b) for b in gate.split_diff(delta)]
         if not gate.reviewable_files(delta_files):
-            self.log.info("%s: delta %s..%s sem arquivo revisável do PR", key, base[:7], head[:7])
+            self.note(key, entry, f"delta {base[:7]}..{head[:7]} sem arquivo revisável do PR")
             entry.update(status="REVIEWED", reviewed_sha=head)
             return
         if self.reviews_left <= 0:
-            self.log.info("%s: review do delta adiada, limite da execução atingido", key)
-            return
+            return self.note(key, entry, "review do delta adiada, limite de reviews da execução atingido")
         run_dir = self.run_dir(entry, head, "delta")
         _, diff = self.load_inputs(entry, pr, run_dir)
         (run_dir / "delta.patch").write_text(delta, encoding="utf-8", newline="")
@@ -268,9 +298,9 @@ class Bot:
         values = self.prompt_values(entry, pr, run_dir)
         values.update(REVIEWED_SHA=base, REVIEWED_SHA7=base[:7])
         self.reviews_left -= 1
-        self.log.info("%s: review do delta %s..%s (%d threads abertos)", key, base[:7], head[:7], len(open_threads))
-        payload = reviewer.run_claude(self.cfg, reviewer.render("delta_review.md", values), run_dir, self.log)
-        self.publish(key, entry, pr, payload, gate.right_lines(diff), run_dir, always=False)
+        self.note(key, entry, f"review do delta {base[:7]}..{head[:7]} ({len(open_threads)} threads abertos)")
+        payload, record = self.run_review(entry, "delta", head, "delta_review.md", values, run_dir)
+        record["id"] = self.publish(key, entry, pr, payload, gate.right_lines(diff), run_dir, always=False)
         self.close_fixed(key, payload, open_threads, head)
         entry.update(status="REVIEWED", reviewed_sha=head, reviewed_at=now_iso())
 
@@ -278,17 +308,18 @@ class Bot:
         head = pr["headRefOid"]
         clean, moved = gate.validate_payload(payload, head, anchors)
         if not always and not gate.has_actionable(payload, clean):
-            self.log.info("%s: delta sem blocker nem high novo (%s), nada postado", key, payload.get("counts"))
-            return
+            self.note(key, entry, f"delta sem blocker nem high novo ({payload.get('counts')}), nada postado")
+            return None
         clean["body"] = gate.add_marker(clean["body"], head)
         path = run_dir / "payload.json"
         path.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
         if self.dry_run:
-            self.log.info("%s: [dry-run] postaria review com %d inline (%d no body) — %s", key, len(clean["comments"]), moved, path)
-            return
+            self.note(key, entry, f"[dry-run] postaria review com {len(clean['comments'])} inline ({moved} no body)")
+            return None
         review = self.post(key, entry, clean, path)
         entry.setdefault("review_ids", []).append(review["id"])
-        self.log.info("%s: review %s postada com %d inline (%d no body)", key, review["id"], len(clean["comments"]), moved)
+        self.note(key, entry, f"review {review['id']} postada com {len(clean['comments'])} inline ({moved} no body)")
+        return review["id"]
 
     def post(self, key, entry, clean, path):
         owner, repo, n = entry["owner"], entry["repo"], entry["number"]
@@ -332,36 +363,35 @@ class Bot:
     def approval_gate(self, key, entry, pr):
         owner, repo, n, head = entry["owner"], entry["repo"], entry["number"], pr["headRefOid"]
         if not gate.settled(entry, self.cfg["settle_minutes"]):
-            self.log.info("%s: head %s visto há menos de %d min, esperando o CI registrar", key, head[:7], self.cfg["settle_minutes"])
-            return
+            return self.note(key, entry, f"head {head[:7]} visto há menos de {self.cfg['settle_minutes']} min, esperando o CI registrar")
         ignored = self.cfg["ignore_checks"].get(repo, [])
         verdict, names = gate.ci_verdict(self.gh.checks(owner, repo, n), ignored, self.cfg["require_checks"])
-        if verdict != "pass":
-            self.log.info("%s: CI %s em %s (%s)", key, verdict, head[:7], ", ".join(names[:5]))
-            return
         threads = gate.bot_threads(self.gh.review_threads(owner, repo, n), entry.get("review_ids", []))
         still_open = [t for t in threads if not t["isResolved"]]
+        entry["gate"] = {
+            "sha": head, "ci": verdict, "ci_names": names[:5], "open_threads": len(still_open),
+            "threads": len(threads), "checked_at": now_iso(),
+        }
         if still_open:
-            self.log.info("%s: CI verde, %d de %d threads do bot abertos", key, len(still_open), len(threads))
-            return
+            return self.note(key, entry, f"{len(still_open)} de {len(threads)} threads do bot abertos (CI {verdict})")
+        if verdict != "pass":
+            return self.note(key, entry, f"CI {verdict} em {head[:7]} ({', '.join(names[:5])})")
         if any(
             r["user"] == self.login and r["state"] == "APPROVED" and r["commit_id"] == head
             for r in self.gh.reviews(owner, repo, n)
         ):
             entry.update(status="APPROVED", approved_sha=head)
-            self.log.info("%s: já aprovado em %s", key, head[:7])
-            return
+            return self.note(key, entry, f"já aprovado em {head[:7]}")
         if self.dry_run:
             entry.update(status="APPROVED", approved_sha=head)
-            self.log.info("%s: [dry-run] aprovaria em %s (%d threads do bot, CI verde)", key, head[:7], len(threads))
-            return
+            return self.note(key, entry, f"[dry-run] aprovaria em {head[:7]} ({len(threads)} threads do bot, CI verde)")
         body = (
             f"✅ Aprovado pelo bot de review: {len(threads)} thread(s) do bot resolvido(s) e CI verde em `{head[:7]}`."
             f"\n\n<!-- pr-autoapprove approve sha={head} -->"
         )
         self.gh.approve(owner, repo, n, head, body)
         entry.update(status="APPROVED", approved_sha=head, approved_at=now_iso())
-        self.log.info("%s: APROVADO em %s", key, head[:7])
+        self.note(key, entry, f"APROVADO em {head[:7]}")
 
 
 def cleanup_runs():
@@ -384,19 +414,26 @@ def run(cfg, log, mode, dry_run, pr_url):
     bot = Bot(cfg, gh, state, log, dry_run)
     cleanup_runs()
     log.info("início: mode=%s, %d PRs na fila", mode, len(state.prs))
-    if pr_url:
-        m = PR_URL_RE.search(pr_url)
-        if not m:
-            log.error("URL de PR inválida: %s", pr_url)
-            return 2
-        owner, repo, n = m.group(1), m.group(2), int(m.group(3))
-        key = f"{owner}/{repo}#{n}"
-        state.prs.setdefault(key, new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual"))
-        bot.process_all(only_key=key)
-    else:
-        bot.discover()
-        bot.process_all()
-    log.info("fim: %d review(s) feita(s), %d PRs na fila", cfg["max_reviews_per_run"] - bot.reviews_left, len(state.prs))
+    state.data["run"] = {"mode": mode, "started_at": now_iso(), "finished_at": None, "reviews": 0}
+    bot.save()
+    try:
+        if pr_url:
+            m = PR_URL_RE.search(pr_url)
+            if not m:
+                log.error("URL de PR inválida: %s", pr_url)
+                return 2
+            owner, repo, n = m.group(1), m.group(2), int(m.group(3))
+            key = f"{owner}/{repo}#{n}"
+            state.prs.setdefault(key, new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual"))
+            bot.process_all(only_key=key)
+        else:
+            bot.discover()
+            bot.process_all()
+    finally:
+        done = cfg["max_reviews_per_run"] - bot.reviews_left
+        state.data["run"].update(finished_at=now_iso(), reviews=done)
+        bot.save()
+    log.info("fim: %d review(s) feita(s), %d PRs na fila", done, len(state.prs))
     return 0
 
 

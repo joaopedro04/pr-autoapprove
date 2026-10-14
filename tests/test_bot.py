@@ -129,6 +129,11 @@ class BotFlowTest(unittest.TestCase):
         e = self.entry()
         self.assertEqual(e["status"], "REVIEWED")
         self.assertEqual(e["review_ids"], [101])
+        self.assertEqual((e["title"], e["author"]), ("t", "colega"))
+        self.assertEqual([(r["kind"], r["sha"], r["id"]) for r in e["reviews"]], [("full", H1, 101)])
+        self.assertEqual(e["reviews"][0]["counts"]["blocker"], 1)
+        self.assertNotIn("activity", e)
+        self.assertIn("visto há menos", e["note"])
         self.assertEqual(self.gh.posted[0]["event"], "COMMENT")
         self.assertIn(f"pr-autoapprove sha={H1}", self.gh.posted[0]["body"])
         self.assertEqual(self.gh.approved, [])
@@ -147,6 +152,32 @@ class BotFlowTest(unittest.TestCase):
         self.bot().process_all()
         self.assertEqual(self.gh.approved, [H1])
         self.assertEqual(self.entry()["status"], "APPROVED")
+        self.assertEqual(self.entry()["gate"]["open_threads"], 0)
+        self.assertEqual(self.entry()["gate"]["ci"], "pass")
+        self.assertEqual(self.entry()["note"], f"APROVADO em {H1[:7]}")
+
+    def test_gate_records_open_threads_even_with_ci_pending(self):
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.age_head()
+        self.gh.checks_list = [{"name": "Lint", "bucket": "pending"}]
+        self.gh.threads = [thread("T1", 101), thread("T2", 101, resolved=True)]
+        self.bot().process_all()
+        gate_info = self.entry()["gate"]
+        self.assertEqual((gate_info["ci"], gate_info["open_threads"], gate_info["threads"]), ("pending", 1, 2))
+        self.assertEqual(self.gh.approved, [])
+
+    def test_activity_is_visible_while_claude_runs(self):
+        seen = {}
+
+        def fake_claude(cfg, prompt, run_dir, log):
+            seen.update(pr_bot.json.loads(self.state.path.read_text(encoding="utf-8"))["prs"][KEY])
+            return payload(H1)
+
+        with mock.patch("reviewer.run_claude", side_effect=fake_claude):
+            self.bot().process_all()
+        self.assertEqual(seen["activity"]["kind"], "full")
+        self.assertNotIn("activity", self.entry())
 
     def test_push_after_approval_runs_delta_and_resolves_only_bot_threads(self):
         e = self.entry()
@@ -250,6 +281,8 @@ class BotFlowTest(unittest.TestCase):
         self.gh.state = "MERGED"
         self.bot().process_all()
         self.assertNotIn(KEY, self.state.prs)
+        done = self.state.data["done"][0]
+        self.assertEqual((done["key"], done["reason"], done["title"]), (KEY, "merged", "t"))
 
     def test_dropped_when_review_no_longer_requested(self):
         self.gh.requested = {"users": ["outra-pessoa"], "teams": ["all-approvers"]}

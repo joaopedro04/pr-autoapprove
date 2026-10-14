@@ -38,6 +38,30 @@ Edite o `.env` (todas as opções estão comentadas no `.env.example`) e rode:
 powershell -ExecutionPolicy Bypass -File install_task.ps1
 ```
 
+## Painel ao vivo
+
+`dashboard.py` serve um painel em `http://127.0.0.1:<DASHBOARD_PORT>/` (padrão 8765), com os PRs agrupados por fase:
+
+- na fila;
+- revisando;
+- aguardando autor;
+- aguardando CI;
+- aprovados;
+- ignorados e erros.
+
+O painel também mostra o motivo de cada espera, as reviews postadas com contagem de achados e custo, os PRs que saíram da fila e o log do dia linha a linha.
+
+As atualizações chegam por Server-Sent Events assim que o bot grava o estado, sem recarregar a página. O servidor:
+- só escuta em `127.0.0.1`;
+- só aceita GET;
+- recusa requisições com `Host` diferente de `127.0.0.1`/`localhost`.
+
+O `install_task.ps1` registra a tarefa `<SCHEDULE_TASK_NAME>-dashboard`, que sobe o painel no logon. Para abrir na mão:
+
+```bash
+python dashboard.py --open
+```
+
 ## Operação
 
 | O quê | Como |
@@ -46,7 +70,8 @@ powershell -ExecutionPolicy Bypass -File install_task.ps1
 | Pausar | `BOT_MODE=off` (ou `dry-run`) |
 | Mudar o intervalo | `SCHEDULE_INTERVAL_MINUTES` no `.env` e rodar o `install_task.ps1` de novo |
 | Um PR só, agora | `python pr_bot.py --pr <url>` (com `--dry-run` para não postar) |
-| Remover a tarefa | `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall` |
+| Remover as tarefas (bot e painel) | `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall` |
+| Painel | `http://127.0.0.1:8765/` (log em `logs/dashboard.log`) |
 | Logs | `logs/AAAA-MM-DD.log` |
 | Insumos e saída de cada review | `runs/<repo>-<n>-<sha7>-<full\|delta>/` (apagados após 7 dias) |
 | Estado | `state.json` (live) e `state.dry-run.json` (dry-run) |

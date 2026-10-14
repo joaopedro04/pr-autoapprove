@@ -57,6 +57,14 @@ def extract_payload(text):
         raise ReviewError(f"payload não é JSON válido: {e}") from e
 
 
+def read_cost(run_dir):
+    try:
+        data = json.loads((run_dir / "claude-output.json").read_text(encoding="utf-8"))
+        return float(data.get("total_cost_usd") or 0)
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+
+
 def write_inputs(run_dir, pr, files, diff, package_json, angular_json, tree):
     run_dir.mkdir(parents=True, exist_ok=True)
     meta = {**pr, "files": [{"path": f} for f in files]}
