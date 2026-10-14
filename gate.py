@@ -171,9 +171,10 @@ def marker_sha(body):
     return m.group(1) if m else None
 
 
-def counts_total(payload):
+def has_actionable(payload, clean):
     counts = payload.get("counts") or {}
-    return sum(v for v in counts.values() if isinstance(v, int))
+    severe = sum(counts.get(k) or 0 for k in INLINE_SEVERITIES if isinstance(counts.get(k), int))
+    return bool(clean["comments"]) or severe > 0
 
 
 def next_action(entry, head):

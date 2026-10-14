@@ -51,6 +51,7 @@ SPEC = {
     "max_reviews_per_run": ("MAX_REVIEWS_PER_RUN", "3", int),
     "max_failures": ("MAX_FAILURES", "3", int),
     "settle_minutes": ("SETTLE_MINUTES", "10", int),
+    "review_debounce_minutes": ("REVIEW_DEBOUNCE_MINUTES", "5", int),
     "require_checks": ("REQUIRE_CHECKS", "true", as_bool),
     "ignore_checks": ("IGNORE_CHECKS", "", as_ignore_checks),
     "review_skill": ("REVIEW_SKILL", None, str),

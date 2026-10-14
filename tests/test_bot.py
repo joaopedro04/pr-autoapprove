@@ -13,7 +13,7 @@ ANGULAR_PKG = '{"dependencies": {"@angular/core": "^16.2.0"}}'
 CFG = {
     "org": "acme", "login": "my-login", "review_teams": ["front-approvers"], "repo_suffixes": ["-mfe", "-frontend", "-ui", "-front", "-container"],
     "extra_repos": [], "exclude_repos": [], "active_since": "2026-10-14", "max_reviews_per_run": 3, "max_failures": 3,
-    "settle_minutes": 10, "require_checks": True, "ignore_checks": {}, "claude_path": "claude", "claude_model": "",
+    "settle_minutes": 10, "review_debounce_minutes": 0, "require_checks": True, "ignore_checks": {}, "claude_path": "claude", "claude_model": "",
     "claude_timeout_minutes": 30, "claude_max_budget_usd": 20, "review_skill": "my-plugin:review",
     "review_plugin": "my-plugin@my-marketplace",
 }
@@ -162,6 +162,38 @@ class BotFlowTest(unittest.TestCase):
         self.assertEqual(self.entry()["status"], "REVIEWED")
         self.assertEqual(self.entry()["reviewed_sha"], H2)
         self.assertEqual(self.gh.approved, [])
+
+    def test_delta_with_only_learning_posts_nothing(self):
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head = H2
+        counts = {"blocker": 0, "high": 0, "suggestion": 0, "learning": 1}
+        with mock.patch("reviewer.run_claude", return_value=payload(H2, counts=counts)):
+            self.bot().process_all()
+        self.assertEqual(self.gh.posted, [])
+        self.assertEqual(self.entry()["reviewed_sha"], H2)
+
+    def test_delta_with_new_high_is_posted(self):
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head = H2
+        counts = {"blocker": 0, "high": 1, "suggestion": 0, "learning": 0}
+        with mock.patch("reviewer.run_claude", return_value=payload(H2, counts=counts)):
+            self.bot().process_all()
+        self.assertEqual(len(self.gh.posted), 1)
+
+    def test_debounce_waits_for_pushes_to_stop(self):
+        cfg = {**CFG, "review_debounce_minutes": 5}
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head = H2
+        with mock.patch("reviewer.run_claude", return_value=payload(H2, [BLOCKER])) as rc:
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+            rc.assert_not_called()
+            self.assertEqual(self.entry()["head_sha"], H2)
+            self.age_head()
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+            rc.assert_called_once()
 
     def test_rewritten_history_falls_back_to_full_review(self):
         e = self.entry()

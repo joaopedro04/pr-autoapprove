@@ -153,6 +153,9 @@ class Bot:
             entry["head_sha"] = head
             entry["head_seen_at"] = now_iso()
         action = gate.next_action(entry, head)
+        if action in ("full_review", "delta_review") and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
+            self.log.info("%s: head %s mudou há menos de %d min, esperando novos pushes antes de revisar", key, head[:7], self.cfg["review_debounce_minutes"])
+            return
         if (
             entry["status"] == "NEW"
             and entry.get("source", "discovery") == "discovery"
@@ -274,8 +277,8 @@ class Bot:
     def publish(self, key, entry, pr, payload, anchors, run_dir, always):
         head = pr["headRefOid"]
         clean, moved = gate.validate_payload(payload, head, anchors)
-        if not always and not clean["comments"] and not moved and gate.counts_total(payload) == 0:
-            self.log.info("%s: nenhum achado novo no delta", key)
+        if not always and not gate.has_actionable(payload, clean):
+            self.log.info("%s: delta sem blocker nem high novo (%s), nada postado", key, payload.get("counts"))
             return
         clean["body"] = gate.add_marker(clean["body"], head)
         path = run_dir / "payload.json"
