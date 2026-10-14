@@ -44,6 +44,11 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["claude_max_budget_usd"], 20.0)
         self.assertEqual(cfg["extra_repos"], [])
 
+    def test_accepts_utf8_bom(self):
+        self.env_file.write_bytes(b"\xef\xbb\xbf" + ENV.lstrip().encode("utf-8"))
+        cfg = config.load_config(self.env_file, {})
+        self.assertEqual(cfg["mode"], "live")
+
     def test_environment_overrides_dotenv(self):
         cfg = self.load(ENV, {"BOT_MODE": "off", "MAX_REVIEWS_PER_RUN": "1"})
         self.assertEqual(cfg["mode"], "off")

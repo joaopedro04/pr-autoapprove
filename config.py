@@ -66,7 +66,7 @@ MODES = ("live", "dry-run", "off")
 
 def load_config(env_file=None, environ=None):
     path = Path(env_file) if env_file else BOT_DIR / ".env"
-    values = parse_dotenv(path.read_text(encoding="utf-8")) if path.exists() else {}
+    values = parse_dotenv(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
     environ = os.environ if environ is None else environ
     cfg, missing = {}, []
     for key, (var, default, parse) in SPEC.items():
