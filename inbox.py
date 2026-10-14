@@ -18,11 +18,11 @@ def folder(bot_dir):
     return bot_dir / "inbox"
 
 
-def enqueue(bot_dir, url):
+def enqueue(bot_dir, url, full=False):
     owner, repo, n = parse_pr_url(url)
     data = {
         "url": f"https://github.com/{owner}/{repo}/pull/{n}", "key": f"{owner}/{repo}#{n}",
-        "requested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "requested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "full": bool(full),
     }
     d = folder(bot_dir)
     d.mkdir(exist_ok=True)

@@ -171,7 +171,7 @@ def spawn_bot():
     )
 
 
-def request_review(source, url):
+def request_review(source, url, full=False):
     cfg, error = source.load()
     if error:
         return 409, {"error": f"config inválida: {error}"}
@@ -183,9 +183,10 @@ def request_review(source, url):
     owner, _, _ = parsed
     if owner.lower() != str(cfg.get("org", "")).lower():
         return 400, {"error": f"só PRs da org {cfg.get('org')}"}
-    item = inbox.enqueue(BOT_DIR, url)
+    item = inbox.enqueue(BOT_DIR, url, full=full)
     spawn_bot()
-    return 202, {"key": item["key"], "message": f"{item['key']} entrou no inbox e o bot foi disparado"}
+    what = "review completa forçada de" if full else "review de"
+    return 202, {"key": item["key"], "full": item["full"], "message": f"{what} {item['key']} pedida e o bot foi disparado"}
 
 
 def sse(event, payload):
@@ -287,7 +288,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.send_json(400, {"error": "JSON inválido"})
         url = body.get("url") if isinstance(body, dict) else None
-        status, payload = request_review(self.server.source, url if isinstance(url, str) else "")
+        full = body.get("full") is True if isinstance(body, dict) else False
+        status, payload = request_review(self.server.source, url if isinstance(url, str) else "", full=full)
         self.server.log.info("pedido manual %s -> %s %s", url, status, payload)
         return self.send_json(status, payload)
 

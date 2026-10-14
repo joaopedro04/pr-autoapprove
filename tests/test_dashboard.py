@@ -232,8 +232,18 @@ class ServerTest(unittest.TestCase):
 
     def test_manual_review_happy_path(self):
         status, data = self.post({"url": "https://github.com/acme/orders-mfe/pull/7"})
-        self.assertEqual((status, data["key"]), (202, "acme/orders-mfe#7"))
+        self.assertEqual((status, data["key"], data["full"]), (202, "acme/orders-mfe#7", False))
         dashboard.spawn_bot.assert_called_once()
+
+    def test_forced_full_review_request(self):
+        status, data = self.post({"url": "https://github.com/acme/orders-mfe/pull/7", "full": True})
+        self.assertEqual((status, data["full"]), (202, True))
+        pending = dashboard.inbox.pending(Path(self.tmp.name))
+        self.assertEqual([(p["key"], p["full"]) for p in pending], [("acme/orders-mfe#7", True)])
+
+    def test_full_flag_must_be_boolean_true(self):
+        status, data = self.post({"url": "https://github.com/acme/orders-mfe/pull/7", "full": "yes"})
+        self.assertEqual((status, data["full"]), (202, False))
 
     def test_manual_review_csrf_guards(self):
         url = {"url": "https://github.com/acme/orders-mfe/pull/7"}

@@ -68,6 +68,12 @@ Casos especiais:
 - PR em erro ou ignorado volta para a fila.
 - PR já revisado no head atual não é revisado de novo; o painel avisa que não há nada novo.
 
+### Forçar review
+
+O botão **Forçar review** de cada card, ou a opção *Forçar review completa* do campo, roda uma review completa nova no head atual, mesmo em PR já revisado ou aprovado. Antes de enviar, a página pede confirmação, porque a review custa e posta no PR.
+
+O bot passa para o Claude os threads do bot que continuam abertos. Ele não repete esses achados e resolve os que o código já corrigiu. Enquanto a review forçada não roda, por exemplo quando o limite de reviews da execução foi atingido, o gate não aprova o PR. Uma aprovação que já está no GitHub continua lá.
+
 O painel nunca escreve no estado do bot. O POST exige três coisas:
 - o token gerado a cada vez que o servidor sobe, embutido na página;
 - um `Origin` do próprio painel;

@@ -236,7 +236,8 @@ class BotFlowTest(unittest.TestCase):
         with mock.patch("reviewer.run_claude", return_value=payload(H2, [BLOCKER])) as rc:
             self.bot().process_all()
         prompt = rc.call_args.args[1]
-        self.assertIn("rebase ou force-push", prompt)
+        self.assertIn("open_threads.json", prompt)
+        self.assertIn("histórico foi reescrito", prompt)
         self.assertEqual(self.entry()["review_ids"], [101, 102])
 
     def test_non_angular_is_skipped_without_claude(self):
@@ -318,6 +319,61 @@ class BotFlowTest(unittest.TestCase):
         rc.assert_not_called()
         self.assertNotIn("force", self.entry())
         self.assertEqual(self.gh.posted, [])
+
+    def drop_full_request(self, url):
+        import inbox
+        inbox.enqueue(Path(self.tmp.name), url, full=True)
+
+    def test_forced_full_review_on_reviewed_head(self):
+        e = self.entry()
+        e.update(status="APPROVED", reviewed_sha=H1, approved_sha=H1, review_ids=[101], head_sha=H1)
+        self.age_head()
+        self.gh.threads = [thread("T1", 101), thread("T2", 101, resolved=True)]
+        self.gh.review_list = [{"id": 101, "user": "my-login", "state": "COMMENTED", "commit_id": H1, "body": ""}]
+        self.drop_full_request(e["url"])
+        bot = self.bot()
+        bot.ingest_inbox()
+        self.assertEqual(self.entry()["note"], "review completa forçada pelo painel")
+        fixed = [{"thread_id": "T1", "evidence": "corrigido"}]
+        with mock.patch("reviewer.run_claude", return_value=payload(H1, fixed=fixed)) as rc:
+            bot.process_all()
+        rc.assert_called_once()
+        prompt = rc.call_args.args[1]
+        self.assertIn("open_threads.json", prompt)
+        open_threads = pr_bot.json.loads((Path(self.tmp.name) / "runs" / f"orders-mfe-7-{H1[:7]}-full" / "open_threads.json").read_text(encoding="utf-8"))
+        self.assertEqual([t["thread_id"] for t in open_threads], ["T1"])
+        self.assertEqual(self.gh.resolved, ["T1"])
+        self.assertEqual(len(self.gh.posted), 1)
+        self.assertNotIn("force", self.entry())
+        self.assertNotIn("force_full", self.entry())
+        self.assertEqual([r["kind"] for r in self.entry()["reviews"]], ["full"])
+
+    def test_forced_full_review_waits_for_budget_instead_of_dropping(self):
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.drop_full_request(e["url"])
+        bot = self.bot()
+        bot.ingest_inbox()
+        bot.reviews_left = 0
+        with mock.patch("reviewer.run_claude") as rc:
+            bot.process_all()
+        rc.assert_not_called()
+        self.assertTrue(self.entry().get("force_full"))
+        self.assertIn("adiada", self.entry()["note"])
+        self.age_head()
+        bot.process_all()
+        self.assertEqual(self.gh.approved, [])
+        self.assertIn("adiada", self.entry()["note"])
+
+    def test_forced_full_review_runs_even_when_bot_review_exists_for_new_entry(self):
+        self.gh.review_list = [{"id": 55, "user": "my-login", "state": "COMMENTED", "commit_id": H1, "body": f"x <!-- pr-autoapprove sha={H1} -->"}]
+        self.drop_full_request(self.entry()["url"])
+        bot = self.bot()
+        bot.ingest_inbox()
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)) as rc:
+            bot.process_all()
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["review_ids"][0], 55)
 
     def test_panel_requests_jump_the_queue(self):
         self.state.prs["acme/a-mfe#1"] = pr_bot.new_entry("acme", "a-mfe", 1, "https://github.com/acme/a-mfe/pull/1")

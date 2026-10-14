@@ -158,6 +158,9 @@ class Bot:
                 entry["source"] = "manual"
                 msg = "review pedido pelo painel"
             entry["force"] = True
+            if request.get("full"):
+                entry["force_full"] = True
+                msg = "review completa forçada pelo painel"
             self.note(key, entry, msg)
             added.append(key)
         if added:
@@ -219,7 +222,7 @@ class Bot:
             entry["head_sha"] = head
             entry["head_seen_at"] = now_iso()
         forced = bool(entry.get("force"))
-        action = gate.next_action(entry, head)
+        action = "full_review" if entry.get("force_full") else gate.next_action(entry, head)
         if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
             return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         if (
@@ -228,15 +231,18 @@ class Bot:
             and not self.is_requested(owner, repo, n)
         ):
             return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
+        reviews_before = len(entry.get("reviews", []))
         if action == "full_review":
             self.full_review(key, entry, pr)
         elif action == "delta_review":
             self.delta_review(key, entry, pr)
         elif forced:
-            self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head")
-        if forced and (action not in REVIEW_ACTIONS or entry.get("reviewed_sha") == head or entry["status"] == "SKIPPED"):
+            self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head (use Forçar review para revisar de novo)")
+        ran = len(entry.get("reviews", [])) > reviews_before or entry["status"] == "SKIPPED"
+        if forced and (action not in REVIEW_ACTIONS or ran or (entry.get("reviewed_sha") == head and not entry.get("force_full"))):
             entry.pop("force", None)
-        if entry["status"] == "REVIEWED" and entry.get("reviewed_sha") == head:
+            entry.pop("force_full", None)
+        if entry["status"] == "REVIEWED" and entry.get("reviewed_sha") == head and not entry.get("force_full"):
             self.approval_gate(key, entry, pr)
 
     def is_requested(self, owner, repo, n):
@@ -282,8 +288,12 @@ class Bot:
 
     def full_review(self, key, entry, pr, open_threads=None):
         owner, repo, n, head = entry["owner"], entry["repo"], entry["number"], pr["headRefOid"]
-        if entry["status"] == "NEW" and not self.dry_run and self.adopt_existing_review(key, entry):
+        adopted = entry["status"] == "NEW" and not self.dry_run and self.adopt_existing_review(key, entry)
+        if adopted and not entry.get("force_full"):
             return
+        if open_threads is None and entry.get("force_full") and entry.get("review_ids"):
+            mine = gate.bot_threads(self.gh.review_threads(owner, repo, n), entry["review_ids"])
+            open_threads = gate.open_thread_summaries(mine)
         files = [f["filename"] for f in self.gh.pr_files(owner, repo, n)]
         if not gate.reviewable_files(files):
             return self.skip(key, entry, head, "nenhum arquivo revisável")
@@ -301,7 +311,7 @@ class Bot:
             values["OPEN_THREADS_SECTION"] = reviewer.OPEN_THREADS_SECTION.format(run_dir=run_dir.as_posix())
             values["FIXED_THREADS_FIELD"] = reviewer.FIXED_THREADS_FIELD
         self.reviews_left -= 1
-        self.note(key, entry, f"review completa em {head[:7]}")
+        self.note(key, entry, f"review completa{' forçada' if entry.get('force_full') else ''} em {head[:7]}")
         payload, record = self.run_review(entry, "full", head, "full_review.md", values, run_dir)
         if payload.get("body", "").strip() == "Nothing to review":
             return self.skip(key, entry, head, "a skill não achou nada para revisar")

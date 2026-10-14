@@ -77,13 +77,18 @@ a:hover { text-decoration: underline; }
 .manual { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 12px; box-shadow: var(--shadow); }
 .manual label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
 .manual-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.manual input { flex: 1 1 280px; min-width: 0; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
-.manual input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 1px; }
+.manual input[type="url"] { flex: 1 1 280px; min-width: 0; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.manual input[type="url"]:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 1px; }
 .manual button { font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; }
 .manual button:disabled { opacity: 0.6; cursor: progress; }
 .manual-msg { font-size: 12px; margin-top: 6px; min-height: 1em; color: var(--muted); }
 .manual-msg.ok { color: var(--ok); }
 .manual-msg.bad { color: var(--bad); }
+.manual .manual-opt { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; font-size: 12px; color: var(--muted); font-weight: 400; }
+.card-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.force { font: inherit; font-size: 12px; color: var(--muted); background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.force:hover:not(:disabled) { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.force:disabled { opacity: 0.5; cursor: default; }
 .pending { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
 .pending li::before { content: "⏳ "; }
 .board { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; align-items: start; margin-bottom: 20px; }
@@ -155,6 +160,7 @@ tr:last-child td { border-bottom: 0; }
       <input id="pr-url" name="url" type="url" inputmode="url" spellcheck="false" placeholder="https://github.com/org/repo/pull/123">
       <button id="manual-btn" type="submit">Revisar</button>
     </div>
+    <label class="manual-opt"><input id="manual-full" type="checkbox"> Forçar review completa, mesmo que o bot já tenha revisado o head atual</label>
     <div id="manual-msg" class="manual-msg" role="status" aria-live="polite"></div>
     <ul id="pending" class="pending" aria-label="Pedidos aguardando o bot"></ul>
   </form>
@@ -307,6 +313,15 @@ function card(pr) {
     c.append(links);
   }
   if (last && !last.url && !pr.activity && state && state.mode === "dry-run") c.append(el("div", "note", "dry-run: nada postado"));
+  const actions = el("div", "card-actions");
+  const force = el("button", "force", pr.activity ? "Revisando…" : "Forçar review");
+  force.type = "button";
+  force.dataset.url = pr.url || "";
+  force.dataset.key = pr.key;
+  force.disabled = Boolean(pr.activity) || isPending(pr.key);
+  if (isPending(pr.key)) force.textContent = "Pedido enviado";
+  actions.append(force);
+  c.append(actions);
   return c;
 }
 
@@ -417,7 +432,7 @@ function renderPending() {
   list.replaceChildren();
   for (const item of state.inbox || []) {
     const li = el("li");
-    li.append(link(item.url, item.key), " · pedido ", since(el("span"), item.requested_at, "ago"), " · aguardando o bot");
+    li.append(link(item.url, item.key), item.full ? " · review completa forçada" : "", " · pedido ", since(el("span"), item.requested_at, "ago"), " · aguardando o bot");
     list.append(li);
   }
   if (state.org) document.getElementById("pr-url").placeholder = `https://github.com/${state.org}/<repo>/pull/<número>`;
@@ -429,35 +444,68 @@ function manualMessage(text, kind) {
   m.textContent = text;
 }
 
+function isPending(key) {
+  return Boolean(state && (state.inbox || []).some((i) => i.key === key));
+}
+
+function confirmFull(key) {
+  const where = state && state.mode === "dry-run" ? "registra a review no log (dry-run)" : "posta uma review nova no PR com o seu usuário";
+  return window.confirm(`Forçar uma review completa de ${key} no head atual?\n\nO Claude roda a skill de novo (custa de US$ 1 a US$ 10) e ${where}. Threads do bot que já estão abertos não são repetidos.`);
+}
+
+async function sendReview(url, full) {
+  const res = await fetch("/api/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-PR-Token": TOKEN },
+    body: JSON.stringify({ url, full }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Erro ${res.status}`);
+  return data;
+}
+
 async function requestReview(event) {
   event.preventDefault();
   const input = document.getElementById("pr-url");
   const button = document.getElementById("manual-btn");
+  const fullBox = document.getElementById("manual-full");
   const url = input.value.trim();
-  if (!/^https:\/\/github\.com\/[\w-]+\/[\w.-]+\/pull\/\d+/.test(url)) {
+  const match = url.match(/^https:\/\/github\.com\/([\w-]+)\/([\w.-]+)\/pull\/(\d+)/);
+  if (!match) {
     manualMessage("Cole a URL do PR, no formato https://github.com/<org>/<repo>/pull/<número>.", "bad");
     input.focus();
     return;
   }
+  if (fullBox.checked && !confirmFull(`${match[1]}/${match[2]}#${match[3]}`)) return;
   button.disabled = true;
   manualMessage("Enviando…");
   try {
-    const res = await fetch("/api/review", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-PR-Token": TOKEN },
-      body: JSON.stringify({ url }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      manualMessage(`✓ ${data.message}. Ele aparece no quadro assim que o bot pegar o pedido.`, "ok");
-      input.value = "";
-    } else {
-      manualMessage(data.error || `Erro ${res.status}`, "bad");
-    }
+    const data = await sendReview(url, fullBox.checked);
+    manualMessage(`✓ ${data.message}. Ele aparece no quadro assim que o bot pegar o pedido.`, "ok");
+    input.value = "";
+    fullBox.checked = false;
   } catch (err) {
-    manualMessage("Não consegui falar com o painel. Ele ainda está rodando?", "bad");
+    manualMessage(err instanceof TypeError ? "Não consegui falar com o painel. Ele ainda está rodando?" : err.message, "bad");
   } finally {
     button.disabled = false;
+  }
+}
+
+async function forceFromCard(event) {
+  const button = event.target.closest("button.force");
+  if (!button || button.disabled) return;
+  const { url, key } = button.dataset;
+  if (!confirmFull(key)) return;
+  button.disabled = true;
+  button.textContent = "Enviando…";
+  try {
+    const data = await sendReview(url, true);
+    manualMessage(`✓ ${data.message}.`, "ok");
+    button.textContent = "Pedido enviado";
+  } catch (err) {
+    manualMessage(err instanceof TypeError ? "Não consegui falar com o painel. Ele ainda está rodando?" : err.message, "bad");
+    button.disabled = false;
+    button.textContent = "Forçar review";
   }
 }
 
@@ -513,6 +561,7 @@ function connect() {
 }
 
 document.getElementById("manual").addEventListener("submit", requestReview);
+document.getElementById("board").addEventListener("click", forceFromCard);
 setInterval(tick, 1000);
 connect();
 </script>

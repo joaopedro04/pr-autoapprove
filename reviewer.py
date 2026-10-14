@@ -18,7 +18,7 @@ START, END = "<<<PAYLOAD", "PAYLOAD>>>"
 OPEN_THREADS_SECTION = """
 ## Threads abertos de reviews anteriores
 
-O PR foi reescrito (rebase ou force-push) depois da última review do bot. `{run_dir}/open_threads.json` lista os threads do bot que continuam abertos, no formato `[{{"thread_id", "path", "line", "body"}}]`. Não repita esses achados. Para cada um, decida se o código atual ainda tem o problema; se não tiver, inclua o thread em `fixed_threads` com uma frase de evidência. Na dúvida, não inclua.
+Este PR já tem threads do bot abertos de reviews anteriores, e esta é uma review completa de novo (o histórico foi reescrito ou o dono do bot pediu). `{run_dir}/open_threads.json` lista os threads do bot que continuam abertos, no formato `[{{"thread_id", "path", "line", "body"}}]`. Não repita esses achados. Para cada um, decida se o código atual ainda tem o problema; se não tiver, inclua o thread em `fixed_threads` com uma frase de evidência. Na dúvida, não inclua.
 """
 FIXED_THREADS_FIELD = ', "fixed_threads": [{"thread_id": "<id do open_threads.json>", "evidence": "<uma frase>"}]'
 
