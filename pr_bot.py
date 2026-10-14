@@ -11,6 +11,7 @@ from pathlib import Path
 
 import config
 import gate
+import inbox
 import reviewer
 from gh_client import Gh, GhError
 
@@ -20,6 +21,8 @@ LOCK_STALE_MINUTES = 150
 RUNS_KEEP_DAYS = 7
 DONE_KEEP = 30
 REVIEWS_KEEP = 20
+REVIEW_ACTIONS = ("full_review", "delta_review")
+INBOX_ROUNDS = 3
 
 
 def now_iso():
@@ -134,6 +137,33 @@ class Bot:
             record["cost_usd"] = reviewer.read_cost(run_dir)
             entry.pop("activity", None)
 
+    def ingest_inbox(self):
+        added = []
+        for request in inbox.drain(BOT_DIR):
+            parsed = inbox.parse_pr_url(request.get("url"))
+            if not parsed:
+                self.log.warning("pedido inválido no inbox: %r", request)
+                continue
+            owner, repo, n = parsed
+            key = f"{owner}/{repo}#{n}"
+            entry = self.state.prs.get(key)
+            if entry is None:
+                entry = self.state.prs[key] = new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual")
+                msg = "adicionado pelo painel"
+            elif entry["status"] in ("ERROR", "SKIPPED"):
+                entry.update(status="NEW", failures=0, source="manual")
+                entry.pop("last_error", None)
+                msg = "reenfileirado pelo painel"
+            else:
+                entry["source"] = "manual"
+                msg = "review pedido pelo painel"
+            entry["force"] = True
+            self.note(key, entry, msg)
+            added.append(key)
+        if added:
+            self.save()
+        return added
+
     def discover(self):
         org = self.cfg["org"]
         filters = f"draft:false -author:app/dependabot -author:{self.login} created:>={self.cfg['active_since']}"
@@ -152,7 +182,8 @@ class Bot:
 
     def process_all(self, only_key=None):
         order = {"REVIEWED": 0, "APPROVED": 1, "SKIPPED": 2, "NEW": 3, "ERROR": 4}
-        keys = [only_key] if only_key else sorted(self.state.prs, key=lambda k: order[self.state.prs[k]["status"]])
+        prs = self.state.prs
+        keys = [only_key] if only_key else sorted(prs, key=lambda k: (not prs[k].get("force"), order[prs[k]["status"]]))
         for key in keys:
             entry = self.state.prs.get(key)
             if not entry:
@@ -187,8 +218,9 @@ class Bot:
         if entry.get("head_sha") != head:
             entry["head_sha"] = head
             entry["head_seen_at"] = now_iso()
+        forced = bool(entry.get("force"))
         action = gate.next_action(entry, head)
-        if action in ("full_review", "delta_review") and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
+        if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
             return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         if (
             entry["status"] == "NEW"
@@ -200,6 +232,10 @@ class Bot:
             self.full_review(key, entry, pr)
         elif action == "delta_review":
             self.delta_review(key, entry, pr)
+        elif forced:
+            self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head")
+        if forced and (action not in REVIEW_ACTIONS or entry.get("reviewed_sha") == head or entry["status"] == "SKIPPED"):
+            entry.pop("force", None)
         if entry["status"] == "REVIEWED" and entry.get("reviewed_sha") == head:
             self.approval_gate(key, entry, pr)
 
@@ -427,8 +463,15 @@ def run(cfg, log, mode, dry_run, pr_url):
             state.prs.setdefault(key, new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual"))
             bot.process_all(only_key=key)
         else:
+            bot.ingest_inbox()
             bot.discover()
             bot.process_all()
+            for _ in range(INBOX_ROUNDS):
+                extra = bot.ingest_inbox()
+                if not extra:
+                    break
+                for key in extra:
+                    bot.process_all(only_key=key)
     finally:
         done = cfg["max_reviews_per_run"] - bot.reviews_left
         state.data["run"].update(finished_at=now_iso(), reviews=done)

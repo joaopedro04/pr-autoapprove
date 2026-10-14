@@ -121,6 +121,11 @@ class HelpersTest(unittest.TestCase):
 class FakeSource:
     def __init__(self):
         self.snap = {"prs": [], "mode": "live"}
+        self.cfg = {"mode": "live", "org": "acme"}
+        self.error = None
+
+    def load(self):
+        return self.cfg, self.error
 
     def snapshot(self):
         return self.snap
@@ -129,15 +134,54 @@ class FakeSource:
         return (1,)
 
 
+class RequestReviewTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for patcher in (
+            mock.patch.object(dashboard, "BOT_DIR", Path(self.tmp.name)),
+            mock.patch.object(dashboard, "spawn_bot"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.source = FakeSource()
+
+    def test_valid_request_enqueues_and_spawns(self):
+        status, payload = dashboard.request_review(self.source, "https://github.com/ACME/orders-mfe/pull/7/files")
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["key"], "ACME/orders-mfe#7")
+        self.assertEqual(len(list((Path(self.tmp.name) / "inbox").glob("*.json"))), 1)
+        dashboard.spawn_bot.assert_called_once()
+
+    def test_rejections(self):
+        cases = [
+            ("https://github.com/other/x-mfe/pull/1", 400),
+            ("https://github.com/acme/x-mfe/issues/1", 400),
+            ("not a url", 400),
+        ]
+        for url, expected in cases:
+            self.assertEqual(dashboard.request_review(self.source, url)[0], expected, url)
+        self.source.cfg = {"mode": "off", "org": "acme"}
+        self.assertEqual(dashboard.request_review(self.source, "https://github.com/acme/x-mfe/pull/1")[0], 409)
+        self.source.cfg, self.source.error = {"mode": "off"}, "faltam no .env: GITHUB_ORG"
+        self.assertEqual(dashboard.request_review(self.source, "https://github.com/acme/x-mfe/pull/1")[0], 409)
+        dashboard.spawn_bot.assert_not_called()
+        self.assertFalse((Path(self.tmp.name) / "inbox").exists())
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         log = Path(self.tmp.name) / "today.log"
         log.write_text("2026-10-14 10:00:00,000 INFO início\n", encoding="utf-8")
-        patcher = mock.patch.object(dashboard, "today_log", return_value=log)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.object(dashboard, "today_log", return_value=log),
+            mock.patch.object(dashboard, "BOT_DIR", Path(self.tmp.name)),
+            mock.patch.object(dashboard, "spawn_bot"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.server = dashboard.make_server(0, FakeSource())
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -165,6 +209,40 @@ class ServerTest(unittest.TestCase):
         conn, res = self.get("/api/state")
         self.assertEqual(json.loads(res.read()), {"prs": [], "mode": "live"})
         conn.close()
+
+    def post(self, body, origin="default", token="default", content_type="application/json"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {"Content-Type": content_type}
+        if origin:
+            headers["Origin"] = f"http://127.0.0.1:{self.port}" if origin == "default" else origin
+        if token:
+            headers["X-PR-Token"] = self.server.token if token == "default" else token
+        conn.request("POST", "/api/review", body=json.dumps(body), headers=headers)
+        res = conn.getresponse()
+        data = json.loads(res.read() or b"{}")
+        conn.close()
+        return res.status, data
+
+    def test_page_embeds_token(self):
+        conn, res = self.get("/")
+        html = res.read().decode("utf-8")
+        conn.close()
+        self.assertIn(self.server.token, html)
+        self.assertNotIn("__PR_TOKEN__", html)
+
+    def test_manual_review_happy_path(self):
+        status, data = self.post({"url": "https://github.com/acme/orders-mfe/pull/7"})
+        self.assertEqual((status, data["key"]), (202, "acme/orders-mfe#7"))
+        dashboard.spawn_bot.assert_called_once()
+
+    def test_manual_review_csrf_guards(self):
+        url = {"url": "https://github.com/acme/orders-mfe/pull/7"}
+        self.assertEqual(self.post(url, origin="https://evil.example")[0], 403)
+        self.assertEqual(self.post(url, origin=None)[0], 403)
+        self.assertEqual(self.post(url, token=None)[0], 403)
+        self.assertEqual(self.post(url, token="adivinhado")[0], 403)
+        self.assertEqual(self.post(url, content_type="text/plain")[0], 415)
+        dashboard.spawn_bot.assert_not_called()
 
     def test_foreign_host_is_refused(self):
         conn, res = self.get("/api/state", host="evil.example:8765")

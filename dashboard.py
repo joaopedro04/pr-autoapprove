@@ -1,6 +1,8 @@
 import argparse
 import json
 import logging
+import secrets
+import subprocess
 import sys
 import time
 import webbrowser
@@ -9,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import config
+import inbox
 
 BOT_DIR = Path(__file__).resolve().parent
 PAGE = BOT_DIR / "dashboard.html"
@@ -16,6 +19,9 @@ LOG_TAIL = 300
 POLL_SECONDS = 1.0
 HEARTBEAT_SECONDS = 15
 STALE_ACTIVITY_GRACE = timedelta(minutes=5)
+MAX_BODY = 4096
+TOKEN_PLACEHOLDER = b"__PR_TOKEN__"
+DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def parse_iso(value):
@@ -86,7 +92,7 @@ def read_json(path):
         return None
 
 
-def snapshot(data, cfg, config_error=None, today=None):
+def snapshot(data, cfg, config_error=None, today=None, pending=None):
     data = data or {"prs": {}}
     run = data.get("run")
     prs = []
@@ -116,7 +122,7 @@ def snapshot(data, cfg, config_error=None, today=None):
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": cfg.get("mode"), "login": cfg.get("login"), "org": cfg.get("org"),
         "interval_minutes": cfg.get("schedule_interval_minutes"), "config_error": config_error,
-        "run": run, "prs": prs, "done": done,
+        "run": run, "prs": prs, "done": done, "inbox": pending or [],
         "cost_today": cost_today(list(data.get("prs", {}).values()) + data.get("done", []), today),
     }
 
@@ -154,6 +160,34 @@ def allowed_host(host, port):
     return host in (f"127.0.0.1:{port}", f"localhost:{port}")
 
 
+def allowed_origin(origin, port):
+    return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+
+
+def spawn_bot():
+    subprocess.Popen(
+        [sys.executable, str(BOT_DIR / "pr_bot.py")], cwd=BOT_DIR, creationflags=DETACHED,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+    )
+
+
+def request_review(source, url):
+    cfg, error = source.load()
+    if error:
+        return 409, {"error": f"config inválida: {error}"}
+    if cfg.get("mode") == "off":
+        return 409, {"error": "o bot está pausado (BOT_MODE=off)"}
+    parsed = inbox.parse_pr_url(url)
+    if not parsed:
+        return 400, {"error": "use a URL do PR, no formato https://github.com/<org>/<repo>/pull/<número>"}
+    owner, _, _ = parsed
+    if owner.lower() != str(cfg.get("org", "")).lower():
+        return 400, {"error": f"só PRs da org {cfg.get('org')}"}
+    item = inbox.enqueue(BOT_DIR, url)
+    spawn_bot()
+    return 202, {"key": item["key"], "message": f"{item['key']} entrou no inbox e o bot foi disparado"}
+
+
 def sse(event, payload):
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
@@ -178,11 +212,11 @@ class Source:
                 out.append(p.stat().st_mtime_ns)
             except OSError:
                 out.append(None)
-        return tuple(out)
+        return tuple(out) + inbox.signature(BOT_DIR)
 
     def snapshot(self):
         cfg, error = self.load()
-        return snapshot(read_json(state_path(cfg)), cfg, error)
+        return snapshot(read_json(state_path(cfg)), cfg, error, pending=inbox.pending(BOT_DIR))
 
 
 CSP = (
@@ -218,13 +252,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?", 1)[0]
         if path == "/":
-            return self.send_bytes(200, "text/html; charset=utf-8", PAGE.read_bytes())
+            page = PAGE.read_bytes().replace(TOKEN_PLACEHOLDER, self.server.token.encode("ascii"))
+            return self.send_bytes(200, "text/html; charset=utf-8", page)
         if path == "/api/state":
             body = json.dumps(self.server.source.snapshot(), ensure_ascii=False).encode("utf-8")
             return self.send_bytes(200, "application/json; charset=utf-8", body)
         if path == "/api/events":
             return self.stream()
         self.send_error(404)
+
+    def send_json(self, status, payload):
+        self.send_bytes(status, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def do_POST(self):
+        if not self.guard():
+            return
+        port = self.server.server_address[1]
+        if not allowed_origin(self.headers.get("Origin", ""), port):
+            return self.send_json(403, {"error": "origem não permitida"})
+        if not secrets.compare_digest(self.headers.get("X-PR-Token", ""), self.server.token):
+            return self.send_json(403, {"error": "token inválido; recarregue o painel"})
+        if self.path.split("?", 1)[0] != "/api/review":
+            return self.send_json(404, {"error": "não encontrado"})
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            return self.send_json(415, {"error": "envie JSON"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            return self.send_json(413, {"error": "corpo grande demais"})
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self.send_json(400, {"error": "JSON inválido"})
+        url = body.get("url") if isinstance(body, dict) else None
+        status, payload = request_review(self.server.source, url if isinstance(url, str) else "")
+        self.server.log.info("pedido manual %s -> %s %s", url, status, payload)
+        return self.send_json(status, payload)
 
     def stream(self):
         self.send_response(200)
@@ -263,11 +328,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
-def make_server(port, source=None):
+def make_server(port, source=None, log=None):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     server.source = source or Source()
     server.stopping = False
+    server.token = secrets.token_urlsafe(32)
+    server.log = log or logging.getLogger("pr-dashboard")
     return server
 
 
@@ -290,7 +357,7 @@ def main():
     cfg, _ = Source().load()
     port = args.port or cfg.get("dashboard_port") or 8765
     try:
-        server = make_server(port)
+        server = make_server(port, log=log)
     except OSError as e:
         log.error("não consegui abrir 127.0.0.1:%s: %s", port, e)
         return 1

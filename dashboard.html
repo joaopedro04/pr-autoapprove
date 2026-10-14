@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="pr-token" content="__PR_TOKEN__">
 <title>pr-autoapprove</title>
 <style>
 :root {
@@ -73,6 +74,18 @@ a:hover { text-decoration: underline; }
 @keyframes blink { 50% { opacity: 0.25; } }
 .banner { border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, var(--surface)); color: var(--text); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
 .banner.bad { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); background: color-mix(in srgb, var(--bad) 10%, var(--surface)); }
+.manual { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 12px; box-shadow: var(--shadow); }
+.manual label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.manual-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.manual input { flex: 1 1 280px; min-width: 0; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.manual input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 1px; }
+.manual button { font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 8px; padding: 8px 16px; cursor: pointer; }
+.manual button:disabled { opacity: 0.6; cursor: progress; }
+.manual-msg { font-size: 12px; margin-top: 6px; min-height: 1em; color: var(--muted); }
+.manual-msg.ok { color: var(--ok); }
+.manual-msg.bad { color: var(--bad); }
+.pending { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.pending li::before { content: "⏳ "; }
 .board { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; align-items: start; margin-bottom: 20px; }
 .col { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 10px; min-width: 0; }
 .col-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 2px 4px 8px; border-bottom: 2px solid var(--col, var(--faint)); margin-bottom: 10px; }
@@ -136,6 +149,15 @@ tr:last-child td { border-bottom: 0; }
   <section id="stats" class="stats" aria-label="Resumo"></section>
   <div id="runbar" class="runbar"></div>
   <div id="banner" class="banner" hidden></div>
+  <form id="manual" class="manual" autocomplete="off" novalidate>
+    <label for="pr-url">Revisar um PR agora</label>
+    <div class="manual-row">
+      <input id="pr-url" name="url" type="url" inputmode="url" spellcheck="false" placeholder="https://github.com/org/repo/pull/123">
+      <button id="manual-btn" type="submit">Revisar</button>
+    </div>
+    <div id="manual-msg" class="manual-msg" role="status" aria-live="polite"></div>
+    <ul id="pending" class="pending" aria-label="Pedidos aguardando o bot"></ul>
+  </form>
   <main id="board" class="board" aria-label="PRs por fase"></main>
   <section class="panel">
     <div class="panel-head"><h2>Saíram da fila</h2></div>
@@ -166,6 +188,7 @@ const COLUMNS = [
 const REASONS = { merged: "Mergeado", closed: "Fechado", not_requested: "Review não pedido" };
 const KINDS = { full: "review completa", delta: "delta" };
 const MAX_LOG = 600;
+const TOKEN = document.querySelector('meta[name="pr-token"]').content;
 let state = null;
 
 function el(tag, cls, text) {
@@ -389,6 +412,55 @@ function renderDone() {
   }
 }
 
+function renderPending() {
+  const list = document.getElementById("pending");
+  list.replaceChildren();
+  for (const item of state.inbox || []) {
+    const li = el("li");
+    li.append(link(item.url, item.key), " · pedido ", since(el("span"), item.requested_at, "ago"), " · aguardando o bot");
+    list.append(li);
+  }
+  if (state.org) document.getElementById("pr-url").placeholder = `https://github.com/${state.org}/<repo>/pull/<número>`;
+}
+
+function manualMessage(text, kind) {
+  const m = document.getElementById("manual-msg");
+  m.className = `manual-msg${kind ? " " + kind : ""}`;
+  m.textContent = text;
+}
+
+async function requestReview(event) {
+  event.preventDefault();
+  const input = document.getElementById("pr-url");
+  const button = document.getElementById("manual-btn");
+  const url = input.value.trim();
+  if (!/^https:\/\/github\.com\/[\w-]+\/[\w.-]+\/pull\/\d+/.test(url)) {
+    manualMessage("Cole a URL do PR, no formato https://github.com/<org>/<repo>/pull/<número>.", "bad");
+    input.focus();
+    return;
+  }
+  button.disabled = true;
+  manualMessage("Enviando…");
+  try {
+    const res = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-PR-Token": TOKEN },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      manualMessage(`✓ ${data.message}. Ele aparece no quadro assim que o bot pegar o pedido.`, "ok");
+      input.value = "";
+    } else {
+      manualMessage(data.error || `Erro ${res.status}`, "bad");
+    }
+  } catch (err) {
+    manualMessage("Não consegui falar com o painel. Ele ainda está rodando?", "bad");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function render(next) {
   state = next;
   const mode = document.getElementById("mode");
@@ -398,6 +470,7 @@ function render(next) {
   renderStats();
   renderRun();
   renderBanner();
+  renderPending();
   renderBoard();
   renderDone();
 }
@@ -439,6 +512,7 @@ function connect() {
   es.addEventListener("log", (e) => appendLog(JSON.parse(e.data), true));
 }
 
+document.getElementById("manual").addEventListener("submit", requestReview);
 setInterval(tick, 1000);
 connect();
 </script>

@@ -5,3 +5,4 @@ logs/
 runs/
 __pycache__/
 .env
+inbox/

@@ -277,6 +277,58 @@ class BotFlowTest(unittest.TestCase):
         self.assertEqual(self.entry()["review_ids"], [55])
         self.assertEqual(self.entry()["status"], "REVIEWED")
 
+    def drop_request(self, url):
+        import inbox
+        inbox.enqueue(Path(self.tmp.name), url)
+
+    def test_panel_request_adds_pr_and_skips_debounce(self):
+        self.state.prs.clear()
+        self.drop_request("https://github.com/acme/new-mfe/pull/3/files")
+        self.gh.requested = {"users": [], "teams": []}
+        cfg = {**CFG, "review_debounce_minutes": 5}
+        bot = pr_bot.Bot(cfg, self.gh, self.state, self.log, False)
+        self.assertEqual(bot.ingest_inbox(), ["acme/new-mfe#3"])
+        e = self.state.prs["acme/new-mfe#3"]
+        self.assertEqual((e["source"], e["force"], e["note"]), ("manual", True, "adicionado pelo painel"))
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)) as rc:
+            bot.process_all()
+        rc.assert_called_once()
+        self.assertEqual(e["status"], "REVIEWED")
+        self.assertNotIn("force", e)
+        self.assertEqual(list((Path(self.tmp.name) / "inbox").glob("*.json")), [])
+
+    def test_panel_request_requeues_error(self):
+        self.entry().update(status="ERROR", failures=3, last_error="boom")
+        self.drop_request(self.entry()["url"])
+        self.bot().ingest_inbox()
+        e = self.entry()
+        self.assertEqual((e["status"], e["failures"], e["force"]), ("NEW", 0, True))
+        self.assertNotIn("last_error", e)
+
+    def test_panel_request_on_reviewed_head_does_not_rereview(self):
+        e = self.entry()
+        e.update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.age_head()
+        self.gh.checks_list = [{"name": "Lint", "bucket": "pending"}]
+        self.drop_request(e["url"])
+        bot = self.bot()
+        bot.ingest_inbox()
+        with mock.patch("reviewer.run_claude") as rc:
+            bot.process_all()
+        rc.assert_not_called()
+        self.assertNotIn("force", self.entry())
+        self.assertEqual(self.gh.posted, [])
+
+    def test_panel_requests_jump_the_queue(self):
+        self.state.prs["acme/a-mfe#1"] = pr_bot.new_entry("acme", "a-mfe", 1, "https://github.com/acme/a-mfe/pull/1")
+        self.drop_request("https://github.com/acme/z-mfe/pull/9")
+        bot = self.bot()
+        bot.ingest_inbox()
+        order = []
+        with mock.patch.object(bot, "process", side_effect=lambda key, entry: order.append(key)):
+            bot.process_all()
+        self.assertEqual(order[0], "acme/z-mfe#9")
+
     def test_closed_pr_leaves_queue(self):
         self.gh.state = "MERGED"
         self.bot().process_all()

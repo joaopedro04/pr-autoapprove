@@ -53,8 +53,27 @@ O painel também mostra o motivo de cada espera, as reviews postadas com contage
 
 As atualizações chegam por Server-Sent Events assim que o bot grava o estado, sem recarregar a página. O servidor:
 - só escuta em `127.0.0.1`;
-- só aceita GET;
+- só aceita GET, exceto o POST do pedido manual (protegido por token e `Origin`);
 - recusa requisições com `Host` diferente de `127.0.0.1`/`localhost`.
+
+### Revisar um PR na hora
+
+O campo **Revisar um PR agora** aceita a URL de um PR da `GITHUB_ORG`.
+
+1. O painel grava o pedido em `inbox/` e dispara o bot.
+2. O bot consome o pedido. Se já houver uma execução rodando, ela pega o pedido ao terminar a fila atual.
+3. O PR entra na frente da fila e pula o debounce. A mesma regra de `--pr` vale aqui: não precisa ter review pedido a você.
+
+Casos especiais:
+- PR em erro ou ignorado volta para a fila.
+- PR já revisado no head atual não é revisado de novo; o painel avisa que não há nada novo.
+
+O painel nunca escreve no estado do bot. O POST exige três coisas:
+- o token gerado a cada vez que o servidor sobe, embutido na página;
+- um `Origin` do próprio painel;
+- `Content-Type: application/json`.
+
+Assim, outro site aberto no navegador não consegue disparar reviews.
 
 O `install_task.ps1` registra a tarefa `<SCHEDULE_TASK_NAME>-dashboard`, que sobe o painel no logon. Para abrir na mão:
 
