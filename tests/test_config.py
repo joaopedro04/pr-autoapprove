@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +87,13 @@ class ConfigTest(unittest.TestCase):
             self.load(ENV.replace("BOT_MODE=live", "BOT_MODE=producao"))
         with self.assertRaises(config.ConfigError):
             self.load(ENV + "SETTLE_MINUTES=dez\n")
+
+    def test_example_documents_every_variable(self):
+        example = config.parse_dotenv((config.BOT_DIR / ".env.example").read_text(encoding="utf-8"))
+        installer = (config.BOT_DIR / "install_task.ps1").read_text(encoding="utf-8-sig")
+        expected = {var for var, _, _ in config.SPEC.values()} | set(re.findall(r"envVars\['([A-Z_]+)'\]", installer))
+        self.assertEqual(sorted(expected - set(example)), [])
+        self.assertEqual(sorted(set(example) - expected), [])
 
     def test_example_file_is_complete(self):
         cfg = config.load_config(config.BOT_DIR / ".env.example", {})
