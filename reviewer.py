@@ -100,8 +100,8 @@ def run_claude(cfg, prompt, run_dir, log):
     except json.JSONDecodeError as e:
         raise ReviewError(f"claude saiu com {p.returncode} sem JSON: {p.stderr.strip()[:400]}") from e
     log.info(
-        "claude: %s em %.0fs, %d turnos, US$ %.2f",
-        data.get("subtype"), (data.get("duration_ms") or 0) / 1000, data.get("num_turns") or 0,
+        "claude [%s]: %s em %.0fs, %d turnos, US$ %.2f",
+        run_dir.name, data.get("subtype"), (data.get("duration_ms") or 0) / 1000, data.get("num_turns") or 0,
         data.get("total_cost_usd") or 0,
     )
     if data.get("is_error") or data.get("subtype") != "success":

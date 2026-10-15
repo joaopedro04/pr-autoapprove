@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -384,6 +386,101 @@ class BotFlowTest(unittest.TestCase):
         with mock.patch.object(bot, "process", side_effect=lambda key, entry: order.append(key)):
             bot.process_all()
         self.assertEqual(order[0], "acme/z-mfe#9")
+
+    def add_prs(self, count):
+        self.state.prs.clear()
+        keys = []
+        for i in range(count):
+            key = f"acme/app{i}-mfe#{i + 1}"
+            self.state.prs[key] = pr_bot.new_entry("acme", f"app{i}-mfe", i + 1, f"https://github.com/acme/app{i}-mfe/pull/{i + 1}")
+            keys.append(key)
+        self.gh.reviews = lambda owner, repo, n: []
+        return keys
+
+    def test_reviews_run_in_parallel_up_to_concurrency(self):
+        keys = self.add_prs(5)
+        cfg = {**CFG, "review_concurrency": 2, "max_reviews_per_run": 10}
+        lock = threading.Lock()
+        live = {"now": 0, "max": 0, "max_activity_on_disk": 0}
+
+        def fake_claude(cfg_, prompt, run_dir, log):
+            with lock:
+                live["now"] += 1
+                live["max"] = max(live["max"], live["now"])
+                on_disk = pr_bot.json.loads(self.state.path.read_text(encoding="utf-8"))["prs"]
+                live["max_activity_on_disk"] = max(live["max_activity_on_disk"], sum(1 for e in on_disk.values() if e.get("activity")))
+            time.sleep(0.15)
+            with lock:
+                live["now"] -= 1
+            return payload(H1)
+
+        with mock.patch("reviewer.run_claude", side_effect=fake_claude) as rc:
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        self.assertEqual(rc.call_count, 5)
+        self.assertEqual(live["max"], 2)
+        self.assertLessEqual(live["max_activity_on_disk"], 2)
+        self.assertEqual({self.state.prs[k]["status"] for k in keys}, {"REVIEWED"})
+        self.assertFalse(any("activity" in self.state.prs[k] for k in keys))
+        self.assertEqual(len(self.gh.posted), 5)
+
+    def test_budget_still_caps_total_reviews(self):
+        keys = self.add_prs(4)
+        cfg = {**CFG, "review_concurrency": 3, "max_reviews_per_run": 2}
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)) as rc:
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        self.assertEqual(rc.call_count, 2)
+        self.assertEqual(sorted(self.state.prs[k]["status"] for k in keys), ["NEW", "NEW", "REVIEWED", "REVIEWED"])
+
+    def test_one_failing_review_does_not_stop_the_others(self):
+        keys = self.add_prs(3)
+        cfg = {**CFG, "review_concurrency": 3, "max_reviews_per_run": 10}
+
+        def flaky(cfg_, prompt, run_dir, log):
+            if "app1-mfe" in str(run_dir):
+                raise pr_bot.reviewer.ReviewError("boom")
+            return payload(H1)
+
+        with mock.patch("reviewer.run_claude", side_effect=flaky):
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        statuses = {k: self.state.prs[k]["status"] for k in keys}
+        self.assertEqual(statuses[keys[1]], "NEW")
+        self.assertEqual(self.state.prs[keys[1]]["failures"], 1)
+        self.assertEqual([statuses[keys[0]], statuses[keys[2]]], ["REVIEWED", "REVIEWED"])
+
+    def test_head_moving_during_review_skips_gate(self):
+        self.age_head()
+
+        def moving(cfg_, prompt, run_dir, log):
+            self.gh.head = H2
+            return payload(H1)
+
+        with mock.patch("reviewer.run_claude", side_effect=moving):
+            self.bot().process_all()
+        e = self.entry()
+        self.assertEqual((e["status"], e["reviewed_sha"], e["head_sha"]), ("REVIEWED", H1, H2))
+        self.assertIn("durante a review", e["note"])
+        self.assertNotIn("gate", e)
+        self.assertEqual(self.gh.approved, [])
+
+    def test_save_retries_when_windows_locks_the_file(self):
+        real_replace = pr_bot.os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        with mock.patch.object(pr_bot.os, "replace", side_effect=flaky_replace), mock.patch.object(pr_bot, "SAVE_RETRY_SECONDS", 0):
+            self.state.save()
+        self.assertEqual(calls["n"], 3)
+        self.assertIn(KEY, pr_bot.json.loads(self.state.path.read_text(encoding="utf-8"))["prs"])
+
+    def test_save_gives_up_after_many_attempts(self):
+        with mock.patch.object(pr_bot.os, "replace", side_effect=PermissionError(5, "Access is denied")), \
+                mock.patch.object(pr_bot, "SAVE_RETRY_SECONDS", 0), self.assertRaises(PermissionError):
+            self.state.save()
 
     def test_closed_pr_leaves_queue(self):
         self.gh.state = "MERGED"

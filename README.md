@@ -11,6 +11,8 @@ O Agendador do Windows roda o bot a cada `SCHEDULE_INTERVAL_MINUTES`, sem depend
 
 1. **Descoberta.** Busca PRs abertos da `GITHUB_ORG` com review pedido ao `GITHUB_LOGIN` **direto** ou a um dos `REVIEW_TEAMS`, em repos cujo nome termina com um dos `REPO_SUFFIXES`. Ficam de fora draft, dependabot, PR do próprio login e PR criado antes de `ACTIVE_SINCE`. Antes da primeira review, o bot confere de novo o pedido; se ele sumiu, o PR sai da fila.
 2. **Review completa.** Baixa diff, `package.json`, `angular.json` e a árvore do head. Depois roda `claude -p` com a `REVIEW_SKILL`, sem Bash, sem Write e sem MCP. O Claude devolve o payload e o bot valida: só `COMMENT`, `commit_id` igual ao head, âncoras no diff, no máximo 30 inline. Quem posta é o bot.
+
+   Até `REVIEW_CONCURRENCY` reviews rodam em paralelo, com teto de `MAX_REVIEWS_PER_RUN` por execução. Só os `claude -p` rodam em threads; ler o GitHub, postar, resolver thread, aprovar e salvar o estado acontecem numa linha só. Cada review é preparada quando abre uma vaga, com o head mais recente. Se o head mudar durante a review, o bot não roda o gate naquele momento e deixa o delta para a próxima execução.
 3. **Push novo.** Espera o head ficar `REVIEW_DEBOUNCE_MINUTES` sem mudar e revisa só o delta desde o último SHA revisado. Resolve os threads do bot que o delta corrigiu e só posta review nova se o delta trouxer blocker ou high; suggestion e learning do delta ficam no log. Se houve rebase ou force-push, faz a review completa.
 4. **Aprovação.** Aprova quando três condições se cumprem:
    - o head está há pelo menos `SETTLE_MINUTES` sem mudar;

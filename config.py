@@ -48,7 +48,8 @@ SPEC = {
     "extra_repos": ("EXTRA_REPOS", "", as_list),
     "exclude_repos": ("EXCLUDE_REPOS", "", as_list),
     "active_since": ("ACTIVE_SINCE", None, str),
-    "max_reviews_per_run": ("MAX_REVIEWS_PER_RUN", "3", int),
+    "max_reviews_per_run": ("MAX_REVIEWS_PER_RUN", "6", int),
+    "review_concurrency": ("REVIEW_CONCURRENCY", "3", int),
     "max_failures": ("MAX_FAILURES", "3", int),
     "settle_minutes": ("SETTLE_MINUTES", "10", int),
     "review_debounce_minutes": ("REVIEW_DEBOUNCE_MINUTES", "5", int),
@@ -85,6 +86,8 @@ def load_config(env_file=None, environ=None):
             raise ConfigError(f"{var}={raw!r} inválido: {e}") from e
     if missing:
         raise ConfigError(f"faltam no .env: {', '.join(missing)}")
+    if cfg["review_concurrency"] < 1:
+        raise ConfigError("REVIEW_CONCURRENCY precisa ser 1 ou mais")
     if cfg["mode"] not in MODES:
         raise ConfigError(f"BOT_MODE precisa ser um de {MODES}, veio {cfg['mode']!r}")
     return cfg

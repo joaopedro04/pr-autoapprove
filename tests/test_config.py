@@ -40,7 +40,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["gh_path"], r"C:\Program Files\GitHub CLI\gh.exe")
         self.assertNotIn("~", cfg["claude_path"])
         self.assertEqual(cfg["repo_suffixes"], ["-mfe", "-frontend", "-ui", "-front", "-container"])
-        self.assertEqual(cfg["max_reviews_per_run"], 3)
+        self.assertEqual(cfg["max_reviews_per_run"], 6)
+        self.assertEqual(cfg["review_concurrency"], 3)
         self.assertEqual(cfg["claude_max_budget_usd"], 20.0)
         self.assertEqual(cfg["extra_repos"], [])
 
@@ -59,6 +60,10 @@ class ConfigTest(unittest.TestCase):
             self.load("BOT_MODE=live\nGITHUB_ORG=x\n")
         self.assertIn("GITHUB_LOGIN", str(ctx.exception))
         self.assertIn("REVIEW_SKILL", str(ctx.exception))
+
+    def test_concurrency_must_be_positive(self):
+        with self.assertRaises(config.ConfigError):
+            self.load(ENV + "REVIEW_CONCURRENCY=0\n")
 
     def test_invalid_mode_and_number(self):
         with self.assertRaises(config.ConfigError):
