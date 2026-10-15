@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from urllib.parse import quote
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -88,8 +89,35 @@ class Gh:
     def pr_view(self, owner, repo, n):
         return self.json(
             "pr", "view", str(n), "-R", f"{owner}/{repo}",
-            "--json", "state,isDraft,headRefOid,baseRefName,headRefName,author,url,title",
+            "--json", "state,isDraft,headRefOid,baseRefName,headRefName,author,url,title,labels",
         )
+
+    def label_exists(self, owner, repo, name):
+        try:
+            self.run("api", f"repos/{owner}/{repo}/labels/{quote(name, safe='')}")
+            return True
+        except GhError as e:
+            if e.not_found:
+                return False
+            raise
+
+    def create_label(self, owner, repo, label):
+        args = ["api", "-X", "POST", f"repos/{owner}/{repo}/labels", "-f", f"name={label['name']}"]
+        if label.get("color"):
+            args += ["-f", f"color={label['color']}"]
+        if label.get("description"):
+            args += ["-f", f"description={label['description']}"]
+        try:
+            self.run(*args)
+        except GhError as e:
+            if "already_exists" not in e.stderr and "HTTP 422" not in e.stderr:
+                raise
+
+    def add_labels(self, owner, repo, n, names):
+        args = ["api", "-X", "POST", f"repos/{owner}/{repo}/issues/{n}/labels"]
+        for name in names:
+            args += ["-f", f"labels[]={name}"]
+        self.run(*args)
 
     def requested_reviewers(self, owner, repo, n):
         return self.json(

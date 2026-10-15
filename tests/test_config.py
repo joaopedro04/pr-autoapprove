@@ -61,6 +61,22 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("GITHUB_LOGIN", str(ctx.exception))
         self.assertIn("REVIEW_SKILL", str(ctx.exception))
 
+    def test_labels_as_comma_list_or_json_array(self):
+        self.assertEqual(self.load(ENV)["pr_labels"], [])
+        cfg = self.load(ENV + "PR_LABELS=ci-autofix, needs-qa\n")
+        self.assertEqual(cfg["pr_labels"], [{"name": "ci-autofix"}, {"name": "needs-qa"}])
+        cfg = self.load(ENV + 'PR_LABELS=["ci-autofix", {"name": "needs-qa", "color": "#0E8A16", "description": "fila de QA"}]\n')
+        self.assertEqual(cfg["pr_labels"], [{"name": "ci-autofix"}, {"name": "needs-qa", "color": "0E8A16", "description": "fila de QA"}])
+
+    def test_invalid_labels(self):
+        for bad in ["PR_LABELS=[nope\n", 'PR_LABELS=[{"color": "fff"}]\n', 'PR_LABELS={"name": "x"}\n']:
+            with self.assertRaises(config.ConfigError, msg=bad):
+                self.load(ENV + bad)
+
+    def test_lists_accept_json_arrays(self):
+        cfg = self.load(ENV.replace("REVIEW_TEAMS=team-a, team-b", 'REVIEW_TEAMS=["team-a", "team-b"]'))
+        self.assertEqual(cfg["review_teams"], ["team-a", "team-b"])
+
     def test_concurrency_must_be_positive(self):
         with self.assertRaises(config.ConfigError):
             self.load(ENV + "REVIEW_CONCURRENCY=0\n")

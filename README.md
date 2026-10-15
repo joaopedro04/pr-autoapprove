@@ -14,7 +14,13 @@ O Agendador do Windows roda o bot a cada `SCHEDULE_INTERVAL_MINUTES`, sem depend
 
    Até `REVIEW_CONCURRENCY` reviews rodam em paralelo, com teto de `MAX_REVIEWS_PER_RUN` por execução. Só os `claude -p` rodam em threads; ler o GitHub, postar, resolver thread, aprovar e salvar o estado acontecem numa linha só. Cada review é preparada quando abre uma vaga, com o head mais recente. Se o head mudar durante a review, o bot não roda o gate naquele momento e deixa o delta para a próxima execução.
 3. **Push novo.** Espera o head ficar `REVIEW_DEBOUNCE_MINUTES` sem mudar e revisa só o delta desde o último SHA revisado. Resolve os threads do bot que o delta corrigiu e só posta review nova se o delta trouxer blocker ou high; suggestion e learning do delta ficam no log. Se houve rebase ou force-push, faz a review completa.
-4. **Aprovação.** Aprova quando três condições se cumprem:
+4. **Labels.** Quando um PR entra na fila, com o pedido de review confirmado, o bot aplica uma vez as labels de `PR_LABELS`.
+   - O formato é uma lista com vírgula ou um array JSON. No JSON, cada item pode trazer cor e descrição.
+   - Se a label não existe no repo, o bot cria com essa cor e descrição.
+   - Se o autor tirar a label depois, ela não volta.
+   - Falha ao aplicar não trava a review: o bot tenta de novo até 3 vezes e registra o erro.
+   - PRs que já estavam na fila quando as labels foram configuradas não recebem a label.
+5. **Aprovação.** Aprova quando três condições se cumprem:
    - o head está há pelo menos `SETTLE_MINUTES` sem mudar;
    - o CI está sem check pendente nem falho;
    - todos os threads do bot estão resolvidos.

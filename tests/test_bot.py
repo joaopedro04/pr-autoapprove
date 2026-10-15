@@ -34,6 +34,11 @@ class FakeGh:
         self.search_items = []
         self.queries = []
         self.requested = {"users": ["my-login"], "teams": []}
+        self.repo_labels = set()
+        self.pr_labels = []
+        self.created_labels = []
+        self.added_labels = []
+        self.label_error = None
 
     def search_prs(self, query):
         self.queries.append(query)
@@ -42,9 +47,23 @@ class FakeGh:
     def requested_reviewers(self, owner, repo, n):
         return self.requested
 
+    def label_exists(self, owner, repo, name):
+        return name in self.repo_labels
+
+    def create_label(self, owner, repo, label):
+        self.created_labels.append(label)
+        self.repo_labels.add(label["name"])
+
+    def add_labels(self, owner, repo, n, names):
+        if self.label_error:
+            raise self.label_error
+        self.added_labels.append(list(names))
+        self.pr_labels += [{"name": name} for name in names]
+
     def pr_view(self, owner, repo, n):
         return {"state": self.state, "isDraft": False, "headRefOid": self.head, "baseRefName": "main", "headRefName": "feature/x",
-                "author": {"login": "colega"}, "url": f"https://github.com/{owner}/{repo}/pull/{n}", "title": "t"}
+                "author": {"login": "colega"}, "url": f"https://github.com/{owner}/{repo}/pull/{n}", "title": "t",
+                "labels": list(self.pr_labels)}
 
     def pr_files(self, owner, repo, n):
         return [{"filename": "src/app/a.component.ts"}, {"filename": "src/app/b.html"}]
@@ -481,6 +500,70 @@ class BotFlowTest(unittest.TestCase):
         with mock.patch.object(pr_bot.os, "replace", side_effect=PermissionError(5, "Access is denied")), \
                 mock.patch.object(pr_bot, "SAVE_RETRY_SECONDS", 0), self.assertRaises(PermissionError):
             self.state.save()
+
+    def label_bot(self, labels, dry_run=False):
+        return pr_bot.Bot({**CFG, "pr_labels": labels}, self.gh, self.state, self.log, dry_run)
+
+    GREENER = {"name": "ci-autofix", "color": "0E8A16", "description": "loop até verde"}
+
+    def test_new_pr_gets_labels_and_missing_label_is_created(self):
+        self.gh.repo_labels = {"other"}
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            self.label_bot([self.GREENER, {"name": "other"}]).process_all()
+        self.assertEqual(self.gh.created_labels, [self.GREENER])
+        self.assertEqual(self.gh.added_labels, [["ci-autofix", "other"]])
+        labels = self.entry()["labels"]
+        self.assertEqual((labels["applied"], labels["created"]), (["ci-autofix", "other"], ["ci-autofix"]))
+        self.assertNotIn("labels_pending", self.entry())
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_labels_are_applied_only_once(self):
+        bot = self.label_bot([self.GREENER])
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            bot.process_all()
+        self.gh.pr_labels = []
+        self.label_bot([self.GREENER]).process_all()
+        self.assertEqual(self.gh.added_labels, [["ci-autofix"]])
+
+    def test_label_already_on_pr_is_not_added_again(self):
+        self.gh.pr_labels = [{"name": "ci-autofix"}]
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            self.label_bot([self.GREENER]).process_all()
+        self.assertEqual((self.gh.added_labels, self.gh.created_labels), ([], []))
+        self.assertEqual(self.entry()["labels"]["applied"], [])
+
+    def test_existing_entries_are_not_labeled(self):
+        self.entry().pop("labels_pending")
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            self.label_bot([self.GREENER]).process_all()
+        self.assertEqual(self.gh.added_labels, [])
+        self.assertNotIn("labels", self.entry())
+
+    def test_without_configured_labels_the_pr_stays_pending(self):
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            self.label_bot([]).process_all()
+        self.assertTrue(self.entry()["labels_pending"])
+        self.label_bot([self.GREENER]).process_all()
+        self.assertEqual(self.gh.added_labels, [["ci-autofix"]])
+
+    def test_dry_run_does_not_touch_labels(self):
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            self.label_bot([self.GREENER], dry_run=True).process_all()
+        self.assertEqual((self.gh.added_labels, self.gh.created_labels), ([], []))
+        self.assertEqual(self.entry()["labels"]["dry_run"], ["ci-autofix"])
+
+    def test_label_failure_does_not_block_review_and_gives_up_after_3(self):
+        self.gh.label_error = pr_bot.GhError(["api"], 1, "HTTP 403: Resource not accessible")
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)) as rc:
+            self.label_bot([self.GREENER]).process_all()
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+        self.assertEqual(self.entry()["failures"], 0)
+        self.assertTrue(self.entry()["labels_pending"])
+        for _ in range(2):
+            self.label_bot([self.GREENER]).process_all()
+        self.assertNotIn("labels_pending", self.entry())
+        self.assertIn("403", self.entry()["labels"]["error"])
 
     def test_closed_pr_leaves_queue(self):
         self.gh.state = "MERGED"

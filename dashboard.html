@@ -303,6 +303,10 @@ function card(pr) {
   if (ci) chips.append(ci);
   const cost = pr.reviews.reduce((s, r) => s + (r.cost_usd || 0), 0);
   if (cost > 0) chips.append(el("span", "chip", money(cost)));
+  if (pr.labels) {
+    for (const name of pr.labels.applied || []) chips.append(el("span", "chip ok", `🏷 ${name}`));
+    if (pr.labels.error) chips.append(el("span", "chip bad", "🏷 label falhou"));
+  }
   if (chips.childElementCount) c.append(chips);
   if (pr.reviews.length) {
     const links = el("div", "links");

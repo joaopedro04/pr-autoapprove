@@ -24,6 +24,7 @@ RUNS_KEEP_DAYS = 7
 DONE_KEEP = 30
 REVIEWS_KEEP = 20
 REVIEW_ACTIONS = ("full_review", "delta_review")
+LABEL_ATTEMPTS = 3
 SAVE_ATTEMPTS = 40
 SAVE_RETRY_SECONDS = 0.05
 INBOX_ROUNDS = 3
@@ -101,7 +102,7 @@ class State:
 def new_entry(owner, repo, number, url, source="discovery"):
     return {
         "owner": owner, "repo": repo, "number": number, "url": url, "status": "NEW", "source": source,
-        "discovered_at": now_iso(), "review_ids": [], "failures": 0,
+        "discovered_at": now_iso(), "review_ids": [], "failures": 0, "labels_pending": True,
     }
 
 
@@ -284,16 +285,17 @@ class Bot:
         if entry.get("head_sha") != head:
             entry["head_sha"] = head
             entry["head_seen_at"] = now_iso()
-        forced = bool(entry.get("force"))
-        action = "full_review" if entry.get("force_full") else gate.next_action(entry, head)
-        if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
-            return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         if (
             entry["status"] == "NEW"
             and entry.get("source", "discovery") == "discovery"
             and not self.is_requested(owner, repo, n)
         ):
             return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
+        self.apply_labels(key, entry, pr)
+        forced = bool(entry.get("force"))
+        action = "full_review" if entry.get("force_full") else gate.next_action(entry, head)
+        if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
+            return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         candidate = Candidate(key, entry, pr, action, forced, len(entry.get("reviews", [])))
         if action in REVIEW_ACTIONS:
             return candidate
@@ -301,6 +303,46 @@ class Bot:
             self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head (use Forçar review para revisar de novo)")
         self.after_action(candidate)
         return None
+
+    def apply_labels(self, key, entry, pr):
+        wanted = self.cfg.get("pr_labels") or []
+        if not entry.get("labels_pending") or not wanted:
+            return
+        owner, repo, n = entry["owner"], entry["repo"], entry["number"]
+        current = {label["name"] for label in pr.get("labels") or []}
+        missing = [label for label in wanted if label["name"] not in current]
+        names = [label["name"] for label in missing]
+        if not missing:
+            entry.pop("labels_pending", None)
+            entry["labels"] = {"applied": [], "created": [], "at": now_iso()}
+            return
+        if self.dry_run:
+            entry.pop("labels_pending", None)
+            entry["labels"] = {"applied": [], "created": [], "dry_run": names, "at": now_iso()}
+            self.log.info("%s: [dry-run] aplicaria as labels %s", key, names)
+            return
+        try:
+            created = []
+            for label in missing:
+                if not self.gh.label_exists(owner, repo, label["name"]):
+                    self.gh.create_label(owner, repo, label)
+                    created.append(label["name"])
+            self.gh.add_labels(owner, repo, n, names)
+        except GhError as e:
+            attempts = entry.get("label_attempts", 0) + 1
+            entry["label_attempts"] = attempts
+            if attempts >= LABEL_ATTEMPTS:
+                entry.pop("labels_pending", None)
+                entry["labels"] = {"applied": [], "created": [], "error": str(e)[:300], "at": now_iso()}
+                self.log.warning("%s: desisti de aplicar as labels %s depois de %d tentativas: %s", key, names, attempts, e)
+            else:
+                self.log.warning("%s: falha ao aplicar as labels %s (tentativa %d): %s", key, names, attempts, e)
+            return
+        entry.pop("labels_pending", None)
+        entry.pop("label_attempts", None)
+        entry["labels"] = {"applied": names, "created": created, "at": now_iso()}
+        suffix = f" (criada(s) no repo: {', '.join(created)})" if created else ""
+        self.log.info("%s: labels aplicadas: %s%s", key, ", ".join(names), suffix)
 
     def after_action(self, c):
         if c.key not in self.state.prs:

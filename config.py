@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -23,7 +24,38 @@ def parse_dotenv(text):
 
 
 def as_list(value):
+    value = value.strip()
+    if value.startswith("["):
+        items = json.loads(value)
+        if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+            raise ValueError("esperado um array de textos")
+        return [i.strip() for i in items if i.strip()]
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def as_labels(value):
+    value = value.strip()
+    if not value:
+        return []
+    if value.startswith("{"):
+        raise ValueError("use um array JSON, por exemplo [{\"name\": \"x\"}]")
+    items = json.loads(value) if value.startswith("[") else as_list(value)
+    if not isinstance(items, list):
+        raise ValueError("esperado um array")
+    labels = []
+    for item in items:
+        if isinstance(item, str):
+            item = {"name": item}
+        name = str(item.get("name", "")).strip() if isinstance(item, dict) else ""
+        if not name:
+            raise ValueError("cada label precisa de um name")
+        label = {"name": name}
+        if item.get("color"):
+            label["color"] = str(item["color"]).lstrip("#")
+        if item.get("description"):
+            label["description"] = str(item["description"])
+        labels.append(label)
+    return labels
 
 
 def as_bool(value):
@@ -44,6 +76,7 @@ SPEC = {
     "org": ("GITHUB_ORG", None, str),
     "login": ("GITHUB_LOGIN", None, str),
     "review_teams": ("REVIEW_TEAMS", "", as_list),
+    "pr_labels": ("PR_LABELS", "", as_labels),
     "repo_suffixes": ("REPO_SUFFIXES", "-mfe,-frontend,-ui,-front,-container", as_list),
     "extra_repos": ("EXTRA_REPOS", "", as_list),
     "exclude_repos": ("EXCLUDE_REPOS", "", as_list),

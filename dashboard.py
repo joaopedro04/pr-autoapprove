@@ -103,7 +103,7 @@ def snapshot(data, cfg, config_error=None, today=None, pending=None):
             "key": key, "url": url, "title": e.get("title"), "author": e.get("author"), "status": e["status"],
             "phase": phase(e, run, cfg), "note": e.get("note"), "note_at": e.get("note_at"),
             "head": (e.get("head_sha") or "")[:7], "reviewed": (e.get("reviewed_sha") or "")[:7],
-            "activity": e.get("activity") if alive else None, "gate": e.get("gate"),
+            "activity": e.get("activity") if alive else None, "gate": e.get("gate"), "labels": e.get("labels"),
             "reviews": [review_view(url, r) for r in e.get("reviews", [])],
             "discovered_at": e.get("discovered_at"), "approved_at": e.get("approved_at"),
             "skip_reason": e.get("skip_reason"),
