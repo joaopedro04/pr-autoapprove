@@ -1,9 +1,11 @@
 import argparse
 import json
 import logging
+import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -12,6 +14,7 @@ from pathlib import Path
 
 import config
 import inbox
+import procs
 
 BOT_DIR = Path(__file__).resolve().parent
 PAGE = BOT_DIR / "dashboard.html"
@@ -21,7 +24,10 @@ HEARTBEAT_SECONDS = 15
 STALE_ACTIVITY_GRACE = timedelta(minutes=5)
 MAX_BODY = 4096
 TOKEN_PLACEHOLDER = b"__PR_TOKEN__"
-DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SCHTASKS = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"
 
 
 def parse_iso(value):
@@ -38,6 +44,8 @@ def activity_alive(entry, run, cfg):
     started = parse_iso(activity.get("started_at"))
     finished = parse_iso((run or {}).get("finished_at"))
     if started and finished and finished >= started:
+        return False
+    if run and not run.get("finished_at") and run.get("alive") is False:
         return False
     limit = timedelta(minutes=cfg.get("claude_timeout_minutes", 30)) + STALE_ACTIVITY_GRACE
     return bool(started) and datetime.now(timezone.utc) - started < limit
@@ -92,9 +100,11 @@ def read_json(path):
         return None
 
 
-def snapshot(data, cfg, config_error=None, today=None, pending=None):
+def snapshot(data, cfg, config_error=None, today=None, pending=None, run_alive=None):
     data = data or {"prs": {}}
     run = data.get("run")
+    if run is not None:
+        run = {**run, "alive": run_alive if not run.get("finished_at") else None}
     prs = []
     for key, e in data.get("prs", {}).items():
         url = e.get("url")
@@ -164,11 +174,25 @@ def allowed_origin(origin, port):
     return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
 
 
-def spawn_bot():
-    subprocess.Popen(
-        [sys.executable, str(BOT_DIR / "pr_bot.py")], cwd=BOT_DIR, creationflags=DETACHED,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+def spawn_bot(task_name=None):
+    if sys.platform == "win32" and task_name:
+        try:
+            result = subprocess.run(
+                [str(SCHTASKS), "/Run", "/TN", task_name], capture_output=True, creationflags=NO_WINDOW, timeout=15,
+            )
+            if result.returncode == 0:
+                return "task"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    args = dict(
+        cwd=BOT_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
     )
+    command = [sys.executable, str(BOT_DIR / "pr_bot.py")]
+    try:
+        subprocess.Popen(command, creationflags=DETACHED | BREAKAWAY, **args)
+    except OSError:
+        subprocess.Popen(command, creationflags=DETACHED, **args)
+    return "process"
 
 
 def request_review(source, url, full=False):
@@ -184,7 +208,7 @@ def request_review(source, url, full=False):
     if owner.lower() != str(cfg.get("org", "")).lower():
         return 400, {"error": f"só PRs da org {cfg.get('org')}"}
     item = inbox.enqueue(BOT_DIR, url, full=full)
-    spawn_bot()
+    spawn_bot(cfg.get("schedule_task_name"))
     what = "review completa forçada de" if full else "review de"
     return 202, {"key": item["key"], "full": item["full"], "message": f"{what} {item['key']} pedida e o bot foi disparado"}
 
@@ -206,7 +230,7 @@ class Source:
         return cfg, error
 
     def signature(self):
-        paths = [BOT_DIR / "state.json", BOT_DIR / "state.dry-run.json", BOT_DIR / ".env"]
+        paths = [BOT_DIR / "state.json", BOT_DIR / "state.dry-run.json", BOT_DIR / ".env", BOT_DIR / "state.lock"]
         out = []
         for p in paths:
             try:
@@ -217,7 +241,11 @@ class Source:
 
     def snapshot(self):
         cfg, error = self.load()
-        return snapshot(read_json(state_path(cfg)), cfg, error, pending=inbox.pending(BOT_DIR))
+        owner = procs.lock_owner(BOT_DIR / "state.lock")
+        return snapshot(
+            read_json(state_path(cfg)), cfg, error, pending=inbox.pending(BOT_DIR),
+            run_alive=owner is not None and procs.pid_alive(owner),
+        )
 
 
 CSP = (
@@ -330,8 +358,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        self.log.exception("erro atendendo %s", client_address)
+
+
 def make_server(port, source=None, log=None):
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = Server(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     server.source = source or Source()
     server.stopping = False
@@ -356,6 +389,8 @@ def main():
     parser.add_argument("--open", action="store_true", help="abre o painel no navegador")
     args = parser.parse_args()
     log = setup_logging()
+    sys.excepthook = lambda kind, value, tb: log.critical("erro não tratado", exc_info=(kind, value, tb))
+    threading.excepthook = lambda hook: log.critical("erro não tratado na thread %s", hook.thread, exc_info=(hook.exc_type, hook.exc_value, hook.exc_traceback))
     cfg, _ = Source().load()
     port = args.port or cfg.get("dashboard_port") or 8765
     try:
@@ -373,6 +408,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        log.exception("o servidor do painel caiu")
+        raise
     finally:
         server.stopping = True
         server.server_close()

@@ -14,6 +14,7 @@ from pathlib import Path
 import config
 import gate
 import inbox
+import procs
 import reviewer
 from gh_client import Gh, GhError
 
@@ -53,6 +54,7 @@ class Lock:
     def __init__(self, path):
         self.path = path
         self.held = False
+        self.stale_owner = None
 
     def __enter__(self):
         for _ in range(2):
@@ -67,7 +69,10 @@ class Lock:
                     age = (time.time() - self.path.stat().st_mtime) / 60
                 except FileNotFoundError:
                     continue
-                if age < LOCK_STALE_MINUTES:
+                owner = procs.lock_owner(self.path)
+                if owner is not None and not procs.pid_alive(owner):
+                    self.stale_owner = owner
+                elif age < LOCK_STALE_MINUTES:
                     return self
                 self.path.unlink(missing_ok=True)
         return self
@@ -651,8 +656,10 @@ def main():
 
     with Lock(BOT_DIR / "state.lock") as lock:
         if not lock.held:
-            log.info("outra execução em andamento, saindo")
+            log.info("outra execução em andamento (pid %s), saindo", procs.lock_owner(lock.path))
             return 0
+        if lock.stale_owner:
+            log.warning("lock do processo %s, que já tinha morrido, foi assumido", lock.stale_owner)
         try:
             return run(cfg, log, mode, mode == "dry-run", args.pr)
         except Exception:

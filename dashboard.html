@@ -352,9 +352,13 @@ function renderRun() {
   const bar = document.getElementById("runbar");
   bar.replaceChildren();
   const run = state.run;
-  if (run && !run.finished_at) {
+  if (run && !run.finished_at && run.alive !== false) {
     const r = el("span", "running", "Bot executando · ");
     r.append(since(el("span"), run.started_at, "elapsed"));
+    bar.append(r);
+  } else if (run && !run.finished_at) {
+    const r = el("span", null, "");
+    r.append("Execução das ", el("strong", null, clock(run.started_at)), " foi interrompida; o bot retoma na próxima execução");
     bar.append(r);
   } else if (run) {
     const last = el("span");

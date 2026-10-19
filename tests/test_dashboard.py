@@ -70,6 +70,18 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snap["cost_today"], 3.5)
         self.assertEqual(snap["interval_minutes"], 3)
 
+    def test_interrupted_run_is_not_shown_as_reviewing(self):
+        data = {
+            "run": {"started_at": iso(-3), "finished_at": None},
+            "prs": {"acme/orders-mfe#7": entry(activity={"kind": "full", "sha": H1, "started_at": iso(-2)})},
+        }
+        alive = dashboard.snapshot(data, CFG, run_alive=True)
+        self.assertEqual((alive["run"]["alive"], alive["prs"][0]["phase"]), (True, "reviewing"))
+        dead = dashboard.snapshot(data, CFG, run_alive=False)
+        self.assertEqual(dead["run"]["alive"], False)
+        self.assertNotEqual(dead["prs"][0]["phase"], "reviewing")
+        self.assertIsNone(dead["prs"][0]["activity"])
+
     def test_empty_state(self):
         snap = dashboard.snapshot(None, CFG, today=date(2026, 1, 1))
         self.assertEqual((snap["prs"], snap["done"], snap["cost_today"]), ([], [], 0))
@@ -121,7 +133,7 @@ class HelpersTest(unittest.TestCase):
 class FakeSource:
     def __init__(self):
         self.snap = {"prs": [], "mode": "live"}
-        self.cfg = {"mode": "live", "org": "acme"}
+        self.cfg = {"mode": "live", "org": "acme", "schedule_task_name": "pr-autoapprove"}
         self.error = None
 
     def load(self):
@@ -132,6 +144,29 @@ class FakeSource:
 
     def signature(self):
         return (1,)
+
+
+class SpawnBotTest(unittest.TestCase):
+    def test_prefers_the_scheduled_task(self):
+        with mock.patch.object(dashboard.sys, "platform", "win32"), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "task")
+        self.assertEqual(run.call_args.args[0][1:], ["/Run", "/TN", "pr-autoapprove"])
+        popen.assert_not_called()
+
+    def test_falls_back_to_process_outside_the_dashboard_job(self):
+        with mock.patch.object(dashboard.sys, "platform", "win32"), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=1)), \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "process")
+        self.assertTrue(popen.call_args.kwargs["creationflags"] & dashboard.BREAKAWAY)
+
+    def test_breakaway_refused_still_spawns(self):
+        with mock.patch.object(dashboard.subprocess, "Popen", side_effect=[OSError(5, "denied"), mock.Mock()]) as popen:
+            self.assertEqual(dashboard.spawn_bot(None), "process")
+        self.assertEqual(popen.call_count, 2)
+        self.assertFalse(popen.call_args.kwargs["creationflags"] & dashboard.BREAKAWAY)
 
 
 class RequestReviewTest(unittest.TestCase):
@@ -151,7 +186,7 @@ class RequestReviewTest(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(payload["key"], "ACME/orders-mfe#7")
         self.assertEqual(len(list((Path(self.tmp.name) / "inbox").glob("*.json"))), 1)
-        dashboard.spawn_bot.assert_called_once()
+        dashboard.spawn_bot.assert_called_once_with("pr-autoapprove")
 
     def test_rejections(self):
         cases = [

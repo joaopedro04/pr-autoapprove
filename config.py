@@ -87,6 +87,7 @@ SPEC = {
     "settle_minutes": ("SETTLE_MINUTES", "10", int),
     "review_debounce_minutes": ("REVIEW_DEBOUNCE_MINUTES", "5", int),
     "schedule_interval_minutes": ("SCHEDULE_INTERVAL_MINUTES", "5", int),
+    "schedule_task_name": ("SCHEDULE_TASK_NAME", "pr-autoapprove", str),
     "dashboard_port": ("DASHBOARD_PORT", "8765", int),
     "require_checks": ("REQUIRE_CHECKS", "true", as_bool),
     "ignore_checks": ("IGNORE_CHECKS", "", as_ignore_checks),
