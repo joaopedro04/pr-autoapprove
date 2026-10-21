@@ -151,6 +151,7 @@ tr:last-child td { border-bottom: 0; }
     </div>
     <span id="conn" class="conn"><span class="dot"></span><span id="conn-label">conectando…</span></span>
   </header>
+  <div id="offline" class="banner bad" role="alert">Sem dados: esta página só funciona servida pelo painel. Abra <a href="http://127.0.0.1:8765/">http://127.0.0.1:8765/</a> no navegador (a porta é a do <code>DASHBOARD_PORT</code>). Abrir o arquivo dashboard.html direto do disco não mostra os PRs.</div>
   <section id="stats" class="stats" aria-label="Resumo"></section>
   <div id="runbar" class="runbar"></div>
   <div id="banner" class="banner" hidden></div>
@@ -519,6 +520,7 @@ async function forceFromCard(event) {
 
 function render(next) {
   state = next;
+  document.getElementById("offline").hidden = true;
   const mode = document.getElementById("mode");
   mode.textContent = state.mode || "—";
   mode.className = `badge ${state.mode || "off"}`;
