@@ -132,7 +132,7 @@ def snapshot(data, cfg, config_error=None, today=None, pending=None, run_alive=N
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": cfg.get("mode"), "login": cfg.get("login"), "org": cfg.get("org"),
         "interval_minutes": cfg.get("schedule_interval_minutes"), "config_error": config_error,
-        "run": run, "prs": prs, "done": done, "inbox": pending or [],
+        "run": run, "prs": prs, "done": done, "inbox": pending or [], "claude_down": data.get("claude_down"),
         "cost_today": cost_today(list(data.get("prs", {}).values()) + data.get("done", []), today),
     }
 

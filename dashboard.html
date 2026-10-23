@@ -89,6 +89,10 @@ a:hover { text-decoration: underline; }
 .force { font: inherit; font-size: 12px; color: var(--muted); background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
 .force:hover:not(:disabled) { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
 .force:disabled { opacity: 0.5; cursor: default; }
+.card-actions { gap: 6px; }
+.retry, .retry-all { font: inherit; font-size: 12px; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.retry:disabled, .retry-all:disabled { opacity: 0.6; cursor: default; }
+.col-head .retry-all { margin-left: auto; padding: 2px 8px; font-size: 11px; }
 .pending { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
 .pending li::before { content: "⏳ "; }
 .board { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; align-items: start; margin-bottom: 20px; }
@@ -319,6 +323,14 @@ function card(pr) {
   }
   if (last && !last.url && !pr.activity && state && state.mode === "dry-run") c.append(el("div", "note", "dry-run: nada postado"));
   const actions = el("div", "card-actions");
+  if (colOf(pr) === "other") {
+    const retry = el("button", "retry", isPending(pr.key) ? "Pedido enviado" : "Tentar de novo");
+    retry.type = "button";
+    retry.dataset.url = pr.url || "";
+    retry.dataset.key = pr.key;
+    retry.disabled = Boolean(pr.activity) || isPending(pr.key);
+    actions.append(retry);
+  }
   const force = el("button", "force", pr.activity ? "Revisando…" : "Forçar review");
   force.type = "button";
   force.dataset.url = pr.url || "";
@@ -379,6 +391,9 @@ function renderBanner() {
   if (state.config_error) {
     text = `Config inválida: ${state.config_error}`;
     b.classList.add("bad");
+  } else if (state.claude_down) {
+    text = `O Claude CLI está indisponível desde ${clock(state.claude_down.at)}: ${state.claude_down.message}. Se for login expirado, rode "claude" num terminal e faça /login. As reviews ficam esperando e não contam como erro do PR.`;
+    b.classList.add("bad");
   } else if (state.mode === "off") {
     text = "Bot pausado (BOT_MODE=off).";
   } else if (state.mode === "dry-run") {
@@ -404,6 +419,12 @@ function renderBoard() {
     col.dataset.phase = c.id;
     const head = el("div", "col-head");
     head.append(el("h2", null, c.label), el("span", "count", String(items.length)));
+    const retryable = c.id === "other" ? items.filter((p) => !p.activity && !isPending(p.key)) : [];
+    if (retryable.length > 1) {
+      const all = el("button", "retry-all", `Tentar todos (${retryable.length})`);
+      all.type = "button";
+      head.append(all);
+    }
     col.append(head, el("div", "col-hint", c.hint));
     const cards = el("div", "cards");
     if (!items.length) cards.append(el("div", "empty", "—"));
@@ -500,6 +521,54 @@ async function requestReview(event) {
   }
 }
 
+function failureMessage(err) {
+  return err instanceof TypeError ? "Não consegui falar com o painel. Ele ainda está rodando?" : err.message;
+}
+
+async function retryFromCard(button) {
+  const { url, key } = button.dataset;
+  button.disabled = true;
+  button.textContent = "Enviando…";
+  try {
+    await sendReview(url, false);
+    manualMessage(`✓ ${key} voltou para a fila e o bot foi disparado.`, "ok");
+    button.textContent = "Pedido enviado";
+  } catch (err) {
+    manualMessage(failureMessage(err), "bad");
+    button.disabled = false;
+    button.textContent = "Tentar de novo";
+  }
+}
+
+async function retryAll(button) {
+  const targets = state.prs.filter((p) => colOf(p) === "other" && !p.activity && !isPending(p.key));
+  if (!targets.length) return;
+  const ok = window.confirm(`Tentar de novo os ${targets.length} PRs da coluna de erros?\n\nCada um volta para a fila e roda uma review (de US$ 1 a US$ 10 cada).`);
+  if (!ok) return;
+  button.disabled = true;
+  let sent = 0;
+  const failed = [];
+  for (const pr of targets) {
+    manualMessage(`Enviando ${sent + 1} de ${targets.length}…`);
+    try {
+      await sendReview(pr.url, false);
+      sent += 1;
+    } catch (err) {
+      failed.push(`${pr.key}: ${failureMessage(err)}`);
+    }
+  }
+  if (failed.length) manualMessage(`${sent} pedido(s) enviado(s); falharam ${failed.length}: ${failed.join(" · ")}`, "bad");
+  else manualMessage(`✓ ${sent} PRs voltaram para a fila e o bot foi disparado.`, "ok");
+}
+
+function onBoardClick(event) {
+  const retry = event.target.closest("button.retry");
+  if (retry && !retry.disabled) return retryFromCard(retry);
+  const all = event.target.closest("button.retry-all");
+  if (all && !all.disabled) return retryAll(all);
+  return forceFromCard(event);
+}
+
 async function forceFromCard(event) {
   const button = event.target.closest("button.force");
   if (!button || button.disabled) return;
@@ -571,7 +640,7 @@ function connect() {
 }
 
 document.getElementById("manual").addEventListener("submit", requestReview);
-document.getElementById("board").addEventListener("click", forceFromCard);
+document.getElementById("board").addEventListener("click", onBoardClick);
 setInterval(tick, 1000);
 connect();
 </script>

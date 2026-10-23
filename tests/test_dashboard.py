@@ -82,6 +82,11 @@ class SnapshotTest(unittest.TestCase):
         self.assertNotEqual(dead["prs"][0]["phase"], "reviewing")
         self.assertIsNone(dead["prs"][0]["activity"])
 
+    def test_claude_down_reaches_the_page(self):
+        snap = dashboard.snapshot({"prs": {}, "claude_down": {"message": "OAuth expirado", "at": iso(-1)}}, CFG)
+        self.assertEqual(snap["claude_down"]["message"], "OAuth expirado")
+        self.assertIsNone(dashboard.snapshot({"prs": {}}, CFG)["claude_down"])
+
     def test_empty_state(self):
         snap = dashboard.snapshot(None, CFG, today=date(2026, 1, 1))
         self.assertEqual((snap["prs"], snap["done"], snap["cost_today"]), ([], [], 0))

@@ -39,6 +39,8 @@ class FakeGh:
         self.created_labels = []
         self.added_labels = []
         self.label_error = None
+        self.pr_view_error = None
+        self.diff_error = None
 
     def search_prs(self, query):
         self.queries.append(query)
@@ -61,6 +63,8 @@ class FakeGh:
         self.pr_labels += [{"name": name} for name in names]
 
     def pr_view(self, owner, repo, n):
+        if self.pr_view_error:
+            raise self.pr_view_error
         return {"state": self.state, "isDraft": False, "headRefOid": self.head, "baseRefName": "main", "headRefName": "feature/x",
                 "author": {"login": "colega"}, "url": f"https://github.com/{owner}/{repo}/pull/{n}", "title": "t",
                 "labels": list(self.pr_labels)}
@@ -69,6 +73,8 @@ class FakeGh:
         return [{"filename": "src/app/a.component.ts"}, {"filename": "src/app/b.html"}]
 
     def pr_diff(self, owner, repo, n):
+        if self.diff_error:
+            raise self.diff_error
         return DIFF
 
     def file_at(self, owner, repo, path, ref):
@@ -564,6 +570,55 @@ class BotFlowTest(unittest.TestCase):
             self.label_bot([self.AUTOFIX_LABEL]).process_all()
         self.assertNotIn("labels_pending", self.entry())
         self.assertIn("403", self.entry()["labels"]["error"])
+
+    def test_claude_unavailable_pauses_reviews_without_failing_prs(self):
+        keys = self.add_prs(3)
+        cfg = {**CFG, "review_concurrency": 1, "max_reviews_per_run": 10}
+        down = pr_bot.reviewer.ClaudeUnavailable("Failed to authenticate: OAuth session expired")
+        with mock.patch("reviewer.run_claude", side_effect=down) as rc:
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        rc.assert_called_once()
+        for key in keys:
+            e = self.state.prs[key]
+            self.assertEqual((e["status"], e["failures"]), ("NEW", 0), key)
+            self.assertEqual(e.get("reviews", []), [], key)
+        self.assertIn("adiada", self.state.prs[keys[0]]["note"])
+        self.assertIn("OAuth", self.state.data["claude_down"]["message"])
+        with mock.patch("reviewer.run_claude", return_value=payload(H1)):
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        self.assertNotIn("claude_down", self.state.data)
+        self.assertEqual({self.state.prs[k]["status"] for k in keys}, {"REVIEWED"})
+
+    def test_diff_too_large_is_skipped_instead_of_failing(self):
+        self.gh.diff_error = pr_bot.GhError(["pr", "diff"], 1, "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)")
+        with mock.patch("reviewer.run_claude") as rc:
+            self.bot().process_all()
+        rc.assert_not_called()
+        e = self.entry()
+        self.assertEqual((e["status"], e["failures"]), ("SKIPPED", 0))
+        self.assertIn("20 mil linhas", e["skip_reason"])
+
+    def test_deleted_repo_leaves_the_queue(self):
+        self.gh.pr_view_error = pr_bot.GhError(["pr", "view"], 1, "GraphQL: Could not resolve to a Repository with the name 'acme/x'. (repository)")
+        self.bot().process_all()
+        self.assertNotIn(KEY, self.state.prs)
+        self.assertEqual(self.state.data["done"][0]["reason"], "not_found")
+
+    def test_forced_review_does_not_loop_on_error_status(self):
+        self.entry().update(status="ERROR", force=True, force_full=True, failures=3)
+        with mock.patch("reviewer.run_claude") as rc:
+            self.bot().process_all()
+        rc.assert_not_called()
+        self.assertEqual(self.entry()["status"], "ERROR")
+
+    def test_retry_from_panel_clears_skip_and_error_leftovers(self):
+        self.entry().update(status="SKIPPED", skipped_sha=H1, skip_reason="nenhum arquivo revisável", last_error="x")
+        self.drop_request(self.entry()["url"])
+        self.bot().ingest_inbox()
+        e = self.entry()
+        self.assertEqual((e["status"], e["force"]), ("NEW", True))
+        for gone in ("skipped_sha", "skip_reason", "last_error"):
+            self.assertNotIn(gone, e)
 
     def test_closed_pr_leaves_queue(self):
         self.gh.state = "MERGED"

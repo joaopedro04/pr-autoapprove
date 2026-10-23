@@ -152,6 +152,7 @@ class Bot:
         self.login = cfg["login"]
         self.reviews_left = cfg["max_reviews_per_run"]
         self.concurrency = max(1, cfg.get("review_concurrency", 1))
+        self.claude_down = None
 
     def save(self):
         self.state.save()
@@ -174,6 +175,11 @@ class Bot:
     def guarded(self, key, entry, fn, reset):
         try:
             result = fn()
+        except reviewer.ClaudeUnavailable as e:
+            self.claude_down = str(e)
+            self.state.data["claude_down"] = {"message": str(e)[:400], "at": now_iso()}
+            self.note(key, entry, f"review adiada: o Claude está indisponível ({str(e)[:160]})", logging.ERROR)
+            return None
         except Exception as e:
             entry["failures"] = entry.get("failures", 0) + 1
             entry["last_error"] = str(e)[:1000]
@@ -204,7 +210,8 @@ class Bot:
                 msg = "adicionado pelo painel"
             elif entry["status"] in ("ERROR", "SKIPPED"):
                 entry.update(status="NEW", failures=0, source="manual")
-                entry.pop("last_error", None)
+                for stale in ("last_error", "skipped_sha", "skip_reason"):
+                    entry.pop(stale, None)
                 msg = "reenfileirado pelo painel"
             else:
                 entry["source"] = "manual"
@@ -258,6 +265,8 @@ class Bot:
         running = {}
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="review") as pool:
             while pending or running:
+                if self.claude_down:
+                    pending.clear()
                 while pending and len(running) < self.concurrency:
                     c = pending.pop(0)
                     if c.key not in self.state.prs:
@@ -279,7 +288,12 @@ class Bot:
     def process(self, key, entry):
         owner, repo, n = entry["owner"], entry["repo"], entry["number"]
         entry.pop("activity", None)
-        pr = self.gh.pr_view(owner, repo, n)
+        try:
+            pr = self.gh.pr_view(owner, repo, n)
+        except GhError as e:
+            if e.not_found:
+                return self.retire(key, entry, "not_found", f"PR ou repo não existe mais ({str(e)[:120]}), saiu da fila")
+            raise
         entry["title"] = pr.get("title")
         entry["author"] = (pr.get("author") or {}).get("login")
         if pr["state"] != "OPEN":
@@ -298,7 +312,7 @@ class Bot:
             return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
         self.apply_labels(key, entry, pr)
         forced = bool(entry.get("force"))
-        action = "full_review" if entry.get("force_full") else gate.next_action(entry, head)
+        action = "full_review" if entry.get("force_full") and entry["status"] != "ERROR" else gate.next_action(entry, head)
         if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
             return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
         candidate = Candidate(key, entry, pr, action, forced, len(entry.get("reviews", [])))
@@ -424,7 +438,12 @@ class Bot:
         if self.reviews_left <= 0:
             return self.note(key, entry, "review adiada, limite de reviews da execução atingido")
         run_dir = self.run_dir(entry, head, "full")
-        _, diff = self.load_inputs(entry, pr, run_dir)
+        try:
+            _, diff = self.load_inputs(entry, pr, run_dir)
+        except GhError as e:
+            if e.diff_too_large:
+                return self.skip(key, entry, head, "diff grande demais para a API do GitHub (mais de 20 mil linhas)")
+            raise
         values = self.prompt_values(entry, pr, run_dir)
         values["OPEN_THREADS_SECTION"] = ""
         values["FIXED_THREADS_FIELD"] = ""
@@ -480,9 +499,15 @@ class Bot:
         key, entry, head = job.key, job.entry, job.head
         try:
             payload = future.result()
+        except reviewer.ClaudeUnavailable:
+            reviews = entry.get("reviews", [])
+            if job.record in reviews:
+                reviews.remove(job.record)
+            raise
         finally:
             entry.pop("activity", None)
             job.record["cost_usd"] = reviewer.read_cost(job.run_dir)
+        self.state.data.pop("claude_down", None)
         job.record["counts"] = payload.get("counts")
         if job.kind == "full" and payload.get("body", "").strip() == "Nothing to review":
             self.skip(key, entry, head, "a skill não achou nada para revisar")

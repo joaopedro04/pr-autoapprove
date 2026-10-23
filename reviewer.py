@@ -23,14 +23,41 @@ Este PR já tem threads do bot abertos de reviews anteriores, e esta é uma revi
 FIXED_THREADS_FIELD = ', "fixed_threads": [{"thread_id": "<id do open_threads.json>", "evidence": "<uma frase>"}]'
 
 
+UNAVAILABLE_MARKERS = (
+    "failed to authenticate", "oauth", "/login", "invalid api key", "credit balance", "rate limit",
+    "overloaded", "usage limit",
+)
+
+
 class ReviewError(RuntimeError):
     pass
 
 
-def plugin_root(plugin_key):
-    installed = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
-    entries = json.loads(installed.read_text(encoding="utf-8"))["plugins"][plugin_key]
-    return Path(entries[0]["installPath"])
+class ClaudeUnavailable(RuntimeError):
+    pass
+
+
+def version_key(path):
+    parts = []
+    for piece in path.name.split("."):
+        parts.append(int(piece) if piece.isdigit() else -1)
+    return parts
+
+
+def plugin_root(plugin_key, home=None):
+    plugins = (home or Path.home()) / ".claude" / "plugins"
+    try:
+        entries = json.loads((plugins / "installed_plugins.json").read_text(encoding="utf-8"))["plugins"][plugin_key]
+        path = Path(entries[0]["installPath"])
+        if path.is_dir():
+            return path
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        pass
+    name, _, marketplace = plugin_key.partition("@")
+    versions = [p for p in (plugins / "cache" / marketplace / name).glob("*") if p.is_dir()]
+    if versions:
+        return max(versions, key=version_key)
+    raise ClaudeUnavailable(f"plugin {plugin_key} não encontrado em {plugins}")
 
 
 def render(name, values):
@@ -105,7 +132,10 @@ def run_claude(cfg, prompt, run_dir, log):
         data.get("total_cost_usd") or 0,
     )
     if data.get("is_error") or data.get("subtype") != "success":
-        raise ReviewError(f"claude terminou com {data.get('subtype')}: {str(data.get('result'))[:400]}")
+        message = str(data.get("result"))[:400]
+        if data.get("api_error_status") in (401, 403, 429, 529) or any(m in message.lower() for m in UNAVAILABLE_MARKERS):
+            raise ClaudeUnavailable(message)
+        raise ReviewError(f"claude terminou com {data.get('subtype')}: {message}")
     payload = extract_payload(data.get("result") or "")
     (run_dir / "payload.raw.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload

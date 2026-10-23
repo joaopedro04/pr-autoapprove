@@ -40,7 +40,11 @@ class GhError(RuntimeError):
 
     @property
     def not_found(self):
-        return "HTTP 404" in self.stderr or "Not Found" in self.stderr
+        return "HTTP 404" in self.stderr or "Not Found" in self.stderr or "Could not resolve to a" in self.stderr
+
+    @property
+    def diff_too_large(self):
+        return "HTTP 406" in self.stderr or "exceeded the maximum number of" in self.stderr
 
     @property
     def server_error(self):
