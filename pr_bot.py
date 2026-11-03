@@ -310,7 +310,8 @@ class Bot:
             and not self.is_requested(owner, repo, n)
         ):
             return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
-        self.apply_labels(key, entry, pr)
+        if entry.get("reviewed_sha"):
+            self.apply_labels(key, entry, pr)
         forced = bool(entry.get("force"))
         action = "full_review" if entry.get("force_full") and entry["status"] != "ERROR" else gate.next_action(entry, head)
         if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
@@ -521,6 +522,8 @@ class Bot:
             entry["head_seen_at"] = now_iso()
             self.note(key, entry, f"head mudou para {latest['headRefOid'][:7]} durante a review; o delta e o gate ficam para a próxima execução")
             job.candidate.pr = latest
+        if entry["status"] == "REVIEWED":
+            self.apply_labels(key, entry, latest)
         self.after_action(job.candidate)
 
     def publish(self, key, entry, pr, payload, anchors, run_dir, always):

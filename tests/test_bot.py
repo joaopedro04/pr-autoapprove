@@ -38,6 +38,7 @@ class FakeGh:
         self.pr_labels = []
         self.created_labels = []
         self.added_labels = []
+        self.reviews_posted_before_label = []
         self.label_error = None
         self.pr_view_error = None
         self.diff_error = None
@@ -59,6 +60,7 @@ class FakeGh:
     def add_labels(self, owner, repo, n, names):
         if self.label_error:
             raise self.label_error
+        self.reviews_posted_before_label.append(len(self.posted))
         self.added_labels.append(list(names))
         self.pr_labels += [{"name": name} for name in names]
 
@@ -522,6 +524,24 @@ class BotFlowTest(unittest.TestCase):
         self.assertEqual((labels["applied"], labels["created"]), (["ci-autofix", "other"], ["ci-autofix"]))
         self.assertNotIn("labels_pending", self.entry())
         self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_labels_wait_for_the_first_review(self):
+        cfg = {**CFG, "review_debounce_minutes": 5, "pr_labels": [self.AUTOFIX_LABEL]}
+        with mock.patch("reviewer.run_claude", return_value=payload(H1, [BLOCKER])) as rc:
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+            rc.assert_not_called()
+            self.assertEqual(self.gh.added_labels, [])
+            self.assertTrue(self.entry()["labels_pending"])
+            self.age_head()
+            pr_bot.Bot(cfg, self.gh, self.state, self.log, False).process_all()
+        self.assertEqual(self.gh.added_labels, [["ci-autofix"]])
+        self.assertEqual(self.gh.reviews_posted_before_label, [1])
+
+    def test_skipped_pr_is_not_labeled(self):
+        self.gh.package = '{"dependencies": {"react": "18"}}'
+        self.label_bot([self.AUTOFIX_LABEL]).process_all()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+        self.assertEqual(self.gh.added_labels, [])
 
     def test_labels_are_applied_only_once(self):
         bot = self.label_bot([self.AUTOFIX_LABEL])
