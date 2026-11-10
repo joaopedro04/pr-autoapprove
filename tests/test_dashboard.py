@@ -296,8 +296,9 @@ class ServerTest(unittest.TestCase):
 
     def test_foreign_host_is_refused(self):
         conn, res = self.get("/api/state", host="evil.example:8765")
-        self.assertEqual(res.status, 403)
+        self.assertEqual(res.status, 401)
         conn.close()
+
 
     def test_unknown_path(self):
         conn, res = self.get("/../.env")
@@ -313,6 +314,82 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(first.startswith(b"event: state\n"))
         self.assertTrue(second.startswith(b"event: log-reset\n"))
         self.assertIn("início".encode("utf-8"), second)
+
+
+class NetworkAccessTest(unittest.TestCase):
+    KEY = "k3y-de-teste_1234567890"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for patcher in (
+            mock.patch.object(dashboard, "BOT_DIR", Path(self.tmp.name)),
+            mock.patch.object(dashboard, "spawn_bot"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.server = dashboard.make_server(0, FakeSource(), access_key=self.KEY)
+        self.port = self.server.server_address[1]
+        self.host = f"192.168.1.50:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.stopping = True
+        self.server.shutdown()
+        self.server.server_close()
+
+    def request(self, method, path, headers=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest(method, path, skip_host=True)
+        for name, value in {"Host": self.host, **(headers or {})}.items():
+            conn.putheader(name, value)
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            conn.putheader("Content-Length", str(len(data)))
+            conn.endheaders(data)
+        else:
+            conn.endheaders()
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        return res
+
+    def test_remote_without_key_is_refused(self):
+        self.assertEqual(self.request("GET", "/").status, 401)
+        self.assertEqual(self.request("GET", "/api/state", {"Cookie": "pra_key=errada-errada-errada"}).status, 401)
+        self.assertEqual(self.request("GET", "/?key=errada-errada-errada").status, 401)
+
+    def test_key_in_url_becomes_cookie_and_is_stripped(self):
+        res = self.request("GET", f"/?key={self.KEY}")
+        self.assertEqual(res.status, 303)
+        self.assertEqual(res.getheader("Location"), "/")
+        cookie = res.getheader("Set-Cookie")
+        self.assertIn(f"pra_key={self.KEY}", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertEqual(self.request("GET", "/api/state", {"Cookie": f"pra_key={self.KEY}"}).status, 200)
+
+    def test_remote_post_needs_cookie_token_and_same_origin(self):
+        token = self.server.token
+        base = {"Cookie": f"pra_key={self.KEY}", "X-PR-Token": token, "Content-Type": "application/json"}
+        body = {"url": "https://github.com/acme/orders-mfe/pull/7"}
+        ok = self.request("POST", "/api/review", {**base, "Origin": f"http://{self.host}"}, body)
+        self.assertEqual(ok.status, 202)
+        cross = self.request("POST", "/api/review", {**base, "Origin": "http://evil.example"}, body)
+        self.assertEqual(cross.status, 403)
+        no_cookie = self.request("POST", "/api/review", {k: v for k, v in base.items() if k != "Cookie"} | {"Origin": f"http://{self.host}"}, body)
+        self.assertEqual(no_cookie.status, 401)
+
+    def test_network_urls(self):
+        with mock.patch.object(dashboard, "local_ipv4s", return_value=["192.168.1.50"]):
+            self.assertEqual(dashboard.network_urls("0.0.0.0", 8765, self.KEY), [f"http://192.168.1.50:8765/?key={self.KEY}"])
+        self.assertEqual(dashboard.network_urls("127.0.0.1", 8765, self.KEY), [])
+        self.assertEqual(dashboard.network_urls("0.0.0.0", 8765, ""), [])
+
+    def test_key_format(self):
+        self.assertTrue(dashboard.KEY_PATTERN.match(self.KEY))
+        for bad in ("curta", "tem espaco no meio aqui", "tem;ponto-e-virgula1234"):
+            self.assertIsNone(dashboard.KEY_PATTERN.match(bad), bad)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,8 @@ SPEC = {
     "schedule_interval_minutes": ("SCHEDULE_INTERVAL_MINUTES", "5", int),
     "schedule_task_name": ("SCHEDULE_TASK_NAME", "pr-autoapprove", str),
     "dashboard_port": ("DASHBOARD_PORT", "8765", int),
+    "dashboard_bind": ("DASHBOARD_BIND", "127.0.0.1", str),
+    "dashboard_access_key": ("DASHBOARD_ACCESS_KEY", "", str),
     "require_checks": ("REQUIRE_CHECKS", "true", as_bool),
     "ignore_checks": ("IGNORE_CHECKS", "", as_ignore_checks),
     "review_skill": ("REVIEW_SKILL", None, str),

@@ -381,6 +381,12 @@ function renderRun() {
     bar.append(el("span", null, "O bot ainda não rodou com este painel."));
   }
   if (state.interval_minutes) bar.append(el("span", null, `roda a cada ${state.interval_minutes} min`));
+  const lan = (state.network_urls || []).filter((u) => !/^http:\/\/172\./.test(u));
+  if (lan.length) {
+    const net = el("span", null, "Na rede: ");
+    lan.forEach((u, i) => net.append(i ? " · " : "", el("code", null, u)));
+    bar.append(net);
+  }
   bar.append(el("span", null, `${state.prs.length} PR(s) acompanhado(s)`));
 }
 

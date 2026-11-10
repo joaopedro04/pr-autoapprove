@@ -2,15 +2,19 @@ import argparse
 import json
 import logging
 import os
+import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import config
 import inbox
@@ -23,6 +27,11 @@ POLL_SECONDS = 1.0
 HEARTBEAT_SECONDS = 15
 STALE_ACTIVITY_GRACE = timedelta(minutes=5)
 MAX_BODY = 4096
+LOOPBACK_BINDS = ("127.0.0.1", "localhost", "::1")
+LOOPBACK_CLIENTS = ("127.0.0.1", "::1")
+KEY_COOKIE = "pra_key"
+KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+KEY_MAX_AGE = 30 * 86400
 TOKEN_PLACEHOLDER = b"__PR_TOKEN__"
 DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
@@ -170,8 +179,32 @@ def allowed_host(host, port):
     return host in (f"127.0.0.1:{port}", f"localhost:{port}")
 
 
-def allowed_origin(origin, port):
-    return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+def allowed_origin(origin, host):
+    return bool(host) and origin == f"http://{host}"
+
+
+def local_ipv4s():
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return []
+    ips = {info[4][0] for info in infos}
+    return sorted(ip for ip in ips if not ip.startswith(("127.", "169.254.")))
+
+
+def network_urls(bind, port, key):
+    if bind in LOOPBACK_BINDS or not key:
+        return []
+    ips = local_ipv4s() if bind in ("0.0.0.0", "") else [bind]
+    return [f"http://{ip}:{port}/?key={key}" for ip in ips]
+
+
+def cookie_key(header):
+    try:
+        morsel = SimpleCookie(header or "").get(KEY_COOKIE)
+    except CookieError:
+        return ""
+    return morsel.value if morsel else ""
 
 
 def spawn_bot(task_name=None):
@@ -242,10 +275,12 @@ class Source:
     def snapshot(self):
         cfg, error = self.load()
         owner = procs.lock_owner(BOT_DIR / "state.lock")
-        return snapshot(
+        snap = snapshot(
             read_json(state_path(cfg)), cfg, error, pending=inbox.pending(BOT_DIR),
             run_alive=owner is not None and procs.pid_alive(owner),
         )
+        snap["network_urls"] = getattr(self, "network_urls", [])
+        return snap
 
 
 CSP = (
@@ -260,10 +295,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def authorized(self):
+        host = self.headers.get("Host", "")
+        if self.client_address[0] in LOOPBACK_CLIENTS and allowed_host(host, self.server.server_address[1]):
+            return True
+        key = self.server.access_key
+        return bool(key) and secrets.compare_digest(cookie_key(self.headers.get("Cookie")), key)
+
     def guard(self):
-        if not allowed_host(self.headers.get("Host", ""), self.server.server_address[1]):
-            self.send_error(403)
+        if self.authorized():
+            return True
+        body = "Acesso negado: abra o painel com ?key=<DASHBOARD_ACCESS_KEY>.".encode("utf-8")
+        self.send_bytes(401, "text/plain; charset=utf-8", body)
+        return False
+
+    def accept_key(self):
+        path, _, query = self.path.partition("?")
+        given = parse_qs(query).get("key", [""])[0]
+        key = self.server.access_key
+        if not (given and key and secrets.compare_digest(given, key)):
             return False
+        self.send_response(303)
+        self.send_header("Location", path or "/")
+        self.send_header("Set-Cookie", f"{KEY_COOKIE}={key}; HttpOnly; SameSite=Strict; Path=/; Max-Age={KEY_MAX_AGE}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
         return True
 
     def send_bytes(self, status, content_type, body):
@@ -277,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not self.guard():
+        if self.accept_key() or not self.guard():
             return
         path = self.path.split("?", 1)[0]
         if path == "/":
@@ -296,8 +353,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.guard():
             return
-        port = self.server.server_address[1]
-        if not allowed_origin(self.headers.get("Origin", ""), port):
+        if not allowed_origin(self.headers.get("Origin", ""), self.headers.get("Host", "")):
             return self.send_json(403, {"error": "origem não permitida"})
         if not secrets.compare_digest(self.headers.get("X-PR-Token", ""), self.server.token):
             return self.send_json(403, {"error": "token inválido; recarregue o painel"})
@@ -360,11 +416,14 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
         self.log.exception("erro atendendo %s", client_address)
 
 
-def make_server(port, source=None, log=None):
-    server = Server(("127.0.0.1", port), Handler)
+def make_server(port, source=None, log=None, bind="127.0.0.1", access_key=""):
+    server = Server((bind, port), Handler)
+    server.access_key = access_key
     server.daemon_threads = True
     server.source = source or Source()
     server.stopping = False
@@ -393,13 +452,20 @@ def main():
     threading.excepthook = lambda hook: log.critical("erro não tratado na thread %s", hook.thread, exc_info=(hook.exc_type, hook.exc_value, hook.exc_traceback))
     cfg, _ = Source().load()
     port = args.port or cfg.get("dashboard_port") or 8765
+    bind = cfg.get("dashboard_bind") or "127.0.0.1"
+    key = cfg.get("dashboard_access_key") or ""
+    if bind not in LOOPBACK_BINDS and not KEY_PATTERN.match(key):
+        log.error("DASHBOARD_BIND=%s exige DASHBOARD_ACCESS_KEY com 16+ caracteres (letras, números, _ ou -); painel só em 127.0.0.1", bind)
+        bind, key = "127.0.0.1", ""
+    source = Source()
+    source.network_urls = network_urls(bind, port, key)
     try:
-        server = make_server(port, log=log)
+        server = make_server(port, source=source, log=log, bind=bind, access_key=key)
     except OSError as e:
-        log.error("não consegui abrir 127.0.0.1:%s: %s", port, e)
+        log.error("não consegui abrir %s:%s: %s", bind, port, e)
         return 1
     url = f"http://127.0.0.1:{port}/"
-    log.info("painel em %s", url)
+    log.info("painel em %s%s", url, f" e na rede em {bind}:{port} (com chave)" if key else "")
     if sys.stdout:
         print(f"Painel em {url}")
     if args.open:

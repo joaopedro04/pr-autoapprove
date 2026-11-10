@@ -60,9 +60,20 @@ powershell -ExecutionPolicy Bypass -File install_task.ps1
 O painel também mostra o motivo de cada espera, as reviews postadas com contagem de achados e custo, os PRs que saíram da fila e o log do dia linha a linha.
 
 As atualizações chegam por Server-Sent Events assim que o bot grava o estado, sem recarregar a página. O servidor:
-- só escuta em `127.0.0.1`;
-- só aceita GET, exceto o POST do pedido manual (protegido por token e `Origin`);
-- recusa requisições com `Host` diferente de `127.0.0.1`/`localhost`.
+- por padrão, só escuta em `127.0.0.1` e recusa requisições com `Host` diferente de `127.0.0.1`/`localhost`;
+- só aceita GET, exceto o POST do pedido manual (protegido por token e `Origin`).
+
+Para abrir na rede (por exemplo, para olhar do celular):
+1. No `.env`, coloque `DASHBOARD_BIND=0.0.0.0` e uma `DASHBOARD_ACCESS_KEY` de 16+ caracteres. Sem a chave, o painel continua só local.
+2. Reinicie a tarefa do painel.
+3. Abra `http://<ip>:<porta>/?key=<chave>` uma vez. A página guarda a chave num cookie (`HttpOnly`, `SameSite=Strict`) e tira a chave do endereço.
+4. Quem não tem a chave recebe 401.
+
+Na própria máquina nada muda, e os links de rede aparecem no topo do painel. O firewall do Windows precisa liberar a porta. Um exemplo, num PowerShell como administrador:
+
+```powershell
+New-NetFirewallRule -DisplayName "pr-autoapprove painel" -Direction Inbound -Protocol TCP -LocalPort 8765 -RemoteAddress LocalSubnet -Program (Get-Command pythonw.exe).Source -Action Allow -Profile Any
+```
 
 ### Revisar um PR na hora
 
