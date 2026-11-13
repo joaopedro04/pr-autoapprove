@@ -5,7 +5,7 @@ Bot local que revisa PRs com uma skill de code review do [Claude Code](https://c
 - os threads abertos pela review do bot estão resolvidos;
 - o CI do head terminou sem falha.
 
-O Agendador do Windows roda o bot a cada `SCHEDULE_INTERVAL_MINUTES`, sem depender do app do Claude estar aberto. O PC precisa estar ligado e com o usuário logado, porque o bot usa as credenciais do `gh` e do `claude` desse usuário.
+O agendador do sistema (Agendador do Windows, systemd no Linux ou launchd no macOS) roda o bot a cada `SCHEDULE_INTERVAL_MINUTES`, sem depender do app do Claude estar aberto. A máquina precisa estar ligada e, em geral, com o usuário logado, porque o bot usa as credenciais do `gh` e do `claude` desse usuário. No Linux, dá para rodar sem sessão aberta (veja a instalação no Linux).
 
 ## Como funciona
 
@@ -40,11 +40,41 @@ Requisitos:
 cp .env.example .env
 ```
 
-Edite o `.env` (todas as opções estão comentadas no `.env.example`) e rode:
+Edite o `.env` (todas as opções estão comentadas no `.env.example`) e rode o instalador do seu sistema. Ele registra o bot e o painel no agendador. Para ver os arquivos e comandos antes de instalar, use `bash install.sh --dry-run` (Linux e macOS).
+
+### Windows
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install_task.ps1
 ```
+
+### Linux
+
+```bash
+bash install.sh
+```
+
+O script cria três unidades do systemd de usuário em `~/.config/systemd/user/`:
+- `<SCHEDULE_TASK_NAME>.service` e `.timer`, que rodam o bot a cada `SCHEDULE_INTERVAL_MINUTES`;
+- `<SCHEDULE_TASK_NAME>-dashboard.service`, que mantém o painel no ar.
+
+Sem linger, o timer só roda com a sua sessão aberta. Com `loginctl enable-linger $USER`, ele roda também sem login, desde que o token do `gh` esteja em arquivo (`gh auth login --insecure-storage`). No keyring (Secret Service), o token fica trancado sem sessão.
+
+Se o systemd de usuário não estiver disponível, o script não instala nada e mostra as linhas de cron aproximadas, com o `PATH` atual. A linha `PATH=` vale para as entradas abaixo dela no crontab. O cron só repete a intervalos exatos quando N divide 60, ou quando N é múltiplo de 60 e N/60 divide 24; nos outros casos o script avisa.
+
+### macOS
+
+```bash
+bash install.sh
+```
+
+O script cria dois agentes do launchd em `~/Library/LaunchAgents/`: `<SCHEDULE_TASK_NAME>.plist` (o bot) e `<SCHEDULE_TASK_NAME>-dashboard.plist` (o painel).
+
+Reinstalar no macOS interrompe uma execução em andamento, porque o `bootout` mata o job.
+
+Não deixe o repo em `~/Documents`, `~/Desktop` ou `~/Downloads`: o launchd esbarra na proteção de privacidade (TCC) e o job falha com `Operation not permitted`. Os agentes aparecem em Ajustes do Sistema > Geral > Itens de Início.
+
+Precisa de `python3` 3.11+. O `/usr/bin/python3` do Xcode pode ser mais antigo. Nesse caso, instale um mais novo e aponte o `PYTHON_PATH` no `.env`.
 
 ## Painel ao vivo
 
@@ -65,11 +95,11 @@ As atualizações chegam por Server-Sent Events assim que o bot grava o estado, 
 
 Para abrir na rede (por exemplo, para olhar do celular):
 1. No `.env`, coloque `DASHBOARD_BIND=0.0.0.0` e uma `DASHBOARD_ACCESS_KEY` de 16+ caracteres. Sem a chave, o painel continua só local.
-2. Reinicie a tarefa do painel.
+2. Reinicie o painel: rode o instalador de novo (ele reinicia o painel) ou reinicie a tarefa, a unidade ou o agente dele.
 3. Abra `http://<ip>:<porta>/?key=<chave>` uma vez. A página guarda a chave num cookie (`HttpOnly`, `SameSite=Strict`) e tira a chave do endereço.
 4. Quem não tem a chave recebe 401.
 
-Na própria máquina nada muda, e os links de rede aparecem no topo do painel. O firewall do Windows precisa liberar a porta. Um exemplo, num PowerShell como administrador:
+Na própria máquina nada muda, e os links de rede aparecem no topo do painel. O firewall da máquina precisa liberar a porta. Um exemplo no Windows, num PowerShell como administrador:
 
 ```powershell
 New-NetFirewallRule -DisplayName "pr-autoapprove painel" -Direction Inbound -Protocol TCP -LocalPort 8765 -RemoteAddress LocalSubnet -Program (Get-Command pythonw.exe).Source -Action Allow -Profile Any
@@ -100,7 +130,7 @@ O painel nunca escreve no estado do bot. O POST exige três coisas:
 
 Assim, outro site aberto no navegador não consegue disparar reviews.
 
-O `install_task.ps1` registra a tarefa `<SCHEDULE_TASK_NAME>-dashboard`, que sobe o painel no logon. Para abrir na mão:
+O `install_task.ps1` e o `install.sh` registram `<SCHEDULE_TASK_NAME>-dashboard`, que sobe o painel no logon. Para abrir na mão:
 
 ```bash
 python dashboard.py --open
@@ -112,9 +142,9 @@ python dashboard.py --open
 |---|---|
 | Ligar de verdade | `BOT_MODE=live` |
 | Pausar | `BOT_MODE=off` (ou `dry-run`) |
-| Mudar o intervalo | `SCHEDULE_INTERVAL_MINUTES` no `.env` e rodar o `install_task.ps1` de novo |
+| Mudar o intervalo | `SCHEDULE_INTERVAL_MINUTES` no `.env` e rodar o instalador de novo: `install_task.ps1` (Windows) ou `bash install.sh` (Linux/macOS) |
 | Um PR só, agora | `python pr_bot.py --pr <url>` (com `--dry-run` para não postar) |
-| Remover as tarefas (bot e painel) | `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall` |
+| Remover as tarefas (bot e painel) | Windows: `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall`. Linux/macOS: `bash install.sh --uninstall` |
 | Painel | `http://127.0.0.1:8765/` (log em `logs/dashboard.log`) |
 | Logs | `logs/AAAA-MM-DD.log` |
 | Insumos e saída de cada review | `runs/<repo>-<n>-<sha7>-<full\|delta>/` (apagados após 7 dias) |

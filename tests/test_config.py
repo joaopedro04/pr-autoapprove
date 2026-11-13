@@ -91,7 +91,12 @@ class ConfigTest(unittest.TestCase):
     def test_example_documents_every_variable(self):
         example = config.parse_dotenv((config.BOT_DIR / ".env.example").read_text(encoding="utf-8"))
         installer = (config.BOT_DIR / "install_task.ps1").read_text(encoding="utf-8-sig")
-        expected = {var for var, _, _ in config.SPEC.values()} | set(re.findall(r"envVars\['([A-Z_]+)'\]", installer))
+        shell_installer = (config.BOT_DIR / "install.sh").read_text(encoding="utf-8")
+        expected = (
+            {var for var, _, _ in config.SPEC.values()}
+            | set(re.findall(r"envVars\['([A-Z_]+)'\]", installer))
+            | set(re.findall(r"env_value ([A-Z_]+)", shell_installer))
+        )
         self.assertEqual(sorted(expected - set(example)), [])
         self.assertEqual(sorted(set(example) - expected), [])
 
