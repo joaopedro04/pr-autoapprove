@@ -207,20 +207,40 @@ def cookie_key(header):
     return morsel.value if morsel else ""
 
 
+def start_via_service_manager(task_name):
+    run_args = {"capture_output": True, "timeout": 15}
+    if sys.platform == "win32":
+        command = [str(SCHTASKS), "/Run", "/TN", task_name]
+        run_args["creationflags"] = NO_WINDOW
+    elif sys.platform.startswith("linux"):
+        command = ["systemctl", "--user", "start", "--no-block", f"{task_name}.service"]
+    elif sys.platform == "darwin":
+        command = ["launchctl", "kickstart", f"gui/{os.getuid()}/{task_name}"]
+    else:
+        return False
+    log = logging.getLogger("pr-dashboard")
+    try:
+        result = subprocess.run(command, **run_args)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("%s falhou: %r", command, exc)
+        return False
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()[:300]
+        log.warning("%s saiu com %s: %s", command, result.returncode, stderr)
+        return False
+    return True
+
+
 def spawn_bot(task_name=None):
-    if sys.platform == "win32" and task_name:
-        try:
-            result = subprocess.run(
-                [str(SCHTASKS), "/Run", "/TN", task_name], capture_output=True, creationflags=NO_WINDOW, timeout=15,
-            )
-            if result.returncode == 0:
-                return "task"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    if task_name and start_via_service_manager(task_name):
+        return "task"
     args = dict(
         cwd=BOT_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
     )
     command = [sys.executable, str(BOT_DIR / "pr_bot.py")]
+    if sys.platform != "win32":
+        subprocess.Popen(command, start_new_session=True, **args)
+        return "process"
     try:
         subprocess.Popen(command, creationflags=DETACHED | BREAKAWAY, **args)
     except OSError:

@@ -162,16 +162,96 @@ class SpawnBotTest(unittest.TestCase):
 
     def test_falls_back_to_process_outside_the_dashboard_job(self):
         with mock.patch.object(dashboard.sys, "platform", "win32"), \
-                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=1)), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=1, stderr=b"")), \
                 mock.patch.object(dashboard.subprocess, "Popen") as popen:
             self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "process")
         self.assertTrue(popen.call_args.kwargs["creationflags"] & dashboard.BREAKAWAY)
 
     def test_breakaway_refused_still_spawns(self):
-        with mock.patch.object(dashboard.subprocess, "Popen", side_effect=[OSError(5, "denied"), mock.Mock()]) as popen:
+        with mock.patch.object(dashboard.sys, "platform", "win32"), \
+                mock.patch.object(dashboard.subprocess, "Popen", side_effect=[OSError(5, "denied"), mock.Mock()]) as popen:
             self.assertEqual(dashboard.spawn_bot(None), "process")
         self.assertEqual(popen.call_count, 2)
         self.assertFalse(popen.call_args.kwargs["creationflags"] & dashboard.BREAKAWAY)
+
+    def test_linux_starts_the_systemd_user_service(self):
+        with mock.patch.object(dashboard.sys, "platform", "linux"), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "task")
+        self.assertEqual(
+            run.call_args.args[0], ["systemctl", "--user", "start", "--no-block", "pr-autoapprove.service"],
+        )
+        popen.assert_not_called()
+
+    def test_macos_kickstarts_the_launchd_job_without_killing_a_running_one(self):
+        with mock.patch.object(dashboard.sys, "platform", "darwin"), \
+                mock.patch.object(dashboard.os, "getuid", return_value=501, create=True), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "task")
+        self.assertEqual(run.call_args.args[0], ["launchctl", "kickstart", "gui/501/pr-autoapprove"])
+        popen.assert_not_called()
+
+    def test_posix_falls_back_to_a_new_session_without_creationflags(self):
+        failures = {
+            "nonzero exit": {"return_value": mock.Mock(returncode=1, stderr=b"")},
+            "missing binary": {"side_effect": FileNotFoundError("systemctl")},
+            "timeout": {"side_effect": dashboard.subprocess.TimeoutExpired("systemctl", 15)},
+        }
+        for label, run_behavior in failures.items():
+            with self.subTest(label), \
+                    mock.patch.object(dashboard.sys, "platform", "linux"), \
+                    mock.patch.object(dashboard.subprocess, "run", **run_behavior), \
+                    mock.patch.object(dashboard.subprocess, "Popen") as popen:
+                self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "process")
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                self.assertNotIn("creationflags", popen.call_args.kwargs)
+
+    def test_logs_why_the_service_manager_failed(self):
+        failed = mock.Mock(returncode=1, stderr=b"Unit pr-autoapprove.service not found.")
+        with mock.patch.object(dashboard.sys, "platform", "linux"), \
+                mock.patch.object(dashboard.subprocess, "run", return_value=failed), \
+                mock.patch.object(dashboard.subprocess, "Popen"), \
+                self.assertLogs("pr-dashboard", "WARNING") as logs:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "process")
+        self.assertIn("pr-autoapprove.service", logs.output[0])
+        self.assertIn("not found", logs.output[0])
+
+    def test_posix_without_a_task_name_skips_the_service_manager(self):
+        with mock.patch.object(dashboard.sys, "platform", "linux"), \
+                mock.patch.object(dashboard.subprocess, "run") as run, \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot(None), "process")
+        run.assert_not_called()
+        self.assertNotIn("creationflags", popen.call_args.kwargs)
+
+    def test_unknown_platform_goes_straight_to_the_fallback(self):
+        with mock.patch.object(dashboard.sys, "platform", "freebsd14"), \
+                mock.patch.object(dashboard.subprocess, "run") as run, \
+                mock.patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertEqual(dashboard.spawn_bot("pr-autoapprove"), "process")
+        run.assert_not_called()
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_really_launches_the_bot_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "ran.txt"
+            (Path(tmp) / "pr_bot.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('ok')\n", encoding="utf-8",
+            )
+            spawned = []
+            real_popen = dashboard.subprocess.Popen
+
+            def capture(*args, **kwargs):
+                spawned.append(real_popen(*args, **kwargs))
+                return spawned[-1]
+
+            with mock.patch.object(dashboard, "BOT_DIR", Path(tmp)), \
+                    mock.patch.object(dashboard.subprocess, "Popen", side_effect=capture):
+                self.assertEqual(dashboard.spawn_bot(None), "process")
+            spawned[-1].wait(timeout=10)
+            self.assertTrue(marker.exists())
 
 
 class RequestReviewTest(unittest.TestCase):

@@ -409,7 +409,7 @@ function renderBanner() {
   const limit = Math.max(3 * (state.interval_minutes || 5), 15) * 60000;
   const ref = run ? ms(run.finished_at || run.started_at) : null;
   if (!text && run && run.finished_at && ref !== null && Date.now() - ref > limit) {
-    text = `A última execução do bot terminou ${ago(run.finished_at)}. Confira a tarefa no Agendador e o log.`;
+    text = `A última execução do bot terminou ${ago(run.finished_at)}. Confira o agendador do sistema e o log.`;
   }
   b.textContent = text;
   b.hidden = !text;
