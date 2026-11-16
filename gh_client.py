@@ -93,7 +93,7 @@ class Gh:
     def pr_view(self, owner, repo, n):
         return self.json(
             "pr", "view", str(n), "-R", f"{owner}/{repo}",
-            "--json", "state,isDraft,headRefOid,baseRefName,headRefName,author,url,title,labels",
+            "--json", "state,isDraft,headRefOid,baseRefName,headRefName,author,url,title,labels,changedFiles",
         )
 
     def label_exists(self, owner, repo, name):

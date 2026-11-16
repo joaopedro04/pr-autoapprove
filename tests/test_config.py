@@ -43,6 +43,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["repo_suffixes"], ["-mfe", "-frontend", "-ui", "-front", "-container"])
         self.assertEqual(cfg["max_reviews_per_run"], 6)
         self.assertEqual(cfg["review_concurrency"], 3)
+        self.assertEqual(cfg["min_changed_files"], 0)
         self.assertEqual(cfg["claude_max_budget_usd"], 20.0)
         self.assertEqual(cfg["extra_repos"], [])
 
@@ -81,6 +82,11 @@ class ConfigTest(unittest.TestCase):
     def test_concurrency_must_be_positive(self):
         with self.assertRaises(config.ConfigError):
             self.load(ENV + "REVIEW_CONCURRENCY=0\n")
+
+    def test_min_changed_files_reads_value_and_rejects_negative(self):
+        self.assertEqual(self.load(ENV + "MIN_CHANGED_FILES=16\n")["min_changed_files"], 16)
+        with self.assertRaises(config.ConfigError):
+            self.load(ENV + "MIN_CHANGED_FILES=-1\n")
 
     def test_invalid_mode_and_number(self):
         with self.assertRaises(config.ConfigError):

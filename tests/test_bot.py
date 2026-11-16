@@ -14,7 +14,7 @@ H1, H2 = "1" * 40, "2" * 40
 ANGULAR_PKG = '{"dependencies": {"@angular/core": "^16.2.0"}}'
 CFG = {
     "org": "acme", "login": "my-login", "review_teams": ["front-approvers"], "repo_suffixes": ["-mfe", "-frontend", "-ui", "-front", "-container"],
-    "extra_repos": [], "exclude_repos": [], "active_since": "2026-10-14", "max_reviews_per_run": 3, "max_failures": 3,
+    "extra_repos": [], "exclude_repos": [], "active_since": "2026-10-14", "max_reviews_per_run": 3, "max_failures": 3, "min_changed_files": 0,
     "settle_minutes": 10, "review_debounce_minutes": 0, "require_checks": True, "ignore_checks": {}, "claude_path": "claude", "claude_model": "",
     "claude_timeout_minutes": 30, "claude_max_budget_usd": 20, "review_skill": "my-plugin:review",
     "review_plugin": "my-plugin@my-marketplace",
@@ -42,6 +42,7 @@ class FakeGh:
         self.label_error = None
         self.pr_view_error = None
         self.diff_error = None
+        self.changed_files = 30
 
     def search_prs(self, query):
         self.queries.append(query)
@@ -69,7 +70,8 @@ class FakeGh:
             raise self.pr_view_error
         return {"state": self.state, "isDraft": False, "headRefOid": self.head, "baseRefName": "main", "headRefName": "feature/x",
                 "author": {"login": "colega"}, "url": f"https://github.com/{owner}/{repo}/pull/{n}", "title": "t",
-                "labels": list(self.pr_labels)}
+                "labels": list(self.pr_labels),
+                **({"changedFiles": self.changed_files} if self.changed_files is not None else {})}
 
     def pr_files(self, owner, repo, n):
         return [{"filename": "src/app/a.component.ts"}, {"filename": "src/app/b.html"}]
@@ -683,6 +685,310 @@ class BotFlowTest(unittest.TestCase):
         ]
         self.bot().discover()
         self.assertEqual(list(self.state.prs), ["acme/status-front#1"])
+
+    def sized_bot(self, minimum=16, **extra):
+        return pr_bot.Bot({**CFG, "min_changed_files": minimum, **extra}, self.gh, self.state, self.log, False)
+
+    def run_sized(self, bot=None):
+        with mock.patch("reviewer.run_claude", return_value=payload(self.gh.head)) as rc:
+            with (
+                mock.patch.object(self.gh, "pr_files", wraps=self.gh.pr_files) as files,
+                mock.patch.object(self.gh, "pr_diff", wraps=self.gh.pr_diff) as diff,
+                mock.patch.object(self.gh, "reviews", wraps=self.gh.reviews) as self.reviews_spy,
+            ):
+                (bot or self.sized_bot()).process_all()
+        return rc, files, diff
+
+    def test_below_minimum_is_skipped_without_touching_claude_diff_or_labels(self):
+        self.gh.changed_files = 15
+        rc, files, diff = self.run_sized(self.sized_bot(pr_labels=[self.AUTOFIX_LABEL]))
+        e = self.entry()
+        self.assertTrue(e["labels_pending"])
+        self.assertEqual(e["status"], "SKIPPED")
+        self.assertEqual(e["skipped_sha"], H1)
+        self.assertEqual(e["skip_reason"], "15 arquivos alterados, abaixo do mínimo de 16")
+        rc.assert_not_called()
+        files.assert_not_called()
+        diff.assert_not_called()
+        self.assertEqual(self.gh.added_labels, [])
+
+    def test_lowering_the_minimum_releases_a_size_skipped_pr_without_push(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        e = self.entry()
+        self.assertEqual((e["status"], e["skip_kind"]), ("SKIPPED", "min_changed_files"))
+        rc, _, _ = self.run_sized(self.sized_bot(10))
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+        self.assertNotIn("skip_kind", self.entry())
+
+    def test_disabling_the_minimum_releases_a_size_skipped_pr_without_push(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        rc, _, _ = self.run_sized(self.sized_bot(0))
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_size_skipped_pr_stays_skipped_while_still_below_minimum(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        rc, _, _ = self.run_sized(self.sized_bot(14))
+        rc.assert_not_called()
+        self.reviews_spy.assert_not_called()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+
+    def test_release_respects_debounce(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        bot = pr_bot.Bot({**CFG, "min_changed_files": 10, "review_debounce_minutes": 5}, self.gh, self.state, self.log, False)
+        self.entry()["head_seen_at"] = datetime.now(timezone.utc).isoformat()
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_not_called()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+        self.assertIn("esperando novos pushes", self.entry()["note"])
+
+    def test_other_skip_on_same_head_is_not_released_by_the_minimum(self):
+        self.gh.package = '{"dependencies": {"react": "18"}}'
+        self.run_sized(self.sized_bot(0))
+        e = self.entry()
+        self.assertEqual(e["status"], "SKIPPED")
+        self.assertNotIn("skip_kind", e)
+        rc, _, _ = self.run_sized(self.sized_bot(0))
+        rc.assert_not_called()
+        self.reviews_spy.assert_not_called()
+        self.assertEqual(self.entry()["skip_reason"], "package.json sem @angular/core")
+
+    def test_other_skip_replaces_size_kind(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        self.gh.head, self.gh.package = H2, '{"dependencies": {"react": "18"}}'
+        self.run_sized(self.sized_bot(10))
+        e = self.entry()
+        self.assertEqual((e["status"], e["skipped_sha"]), ("SKIPPED", H2))
+        self.assertNotIn("skip_kind", e)
+
+    def test_request_review_reopens_discovery_entry_skipped_by_size(self):
+        self.gh.changed_files = 3
+        self.run_sized()
+        self.assertEqual(self.entry()["source"], "discovery")
+        bot = self.sized_bot()
+        self.assertEqual(bot.request_review("acme", "orders-mfe", 7), KEY)
+        e = self.entry()
+        self.assertEqual((e["status"], e["source"], e["force"], e["note"]), ("NEW", "manual", True, "reenfileirado pelo painel"))
+        for stale in ("skipped_sha", "skip_reason", "skip_kind"):
+            self.assertNotIn(stale, e)
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_request_review_reopens_error(self):
+        self.entry().update(status="ERROR", failures=3, last_error="boom")
+        self.sized_bot().request_review("acme", "orders-mfe", 7)
+        e = self.entry()
+        self.assertEqual((e["status"], e["failures"], e["force"]), ("NEW", 0, True))
+        self.assertNotIn("last_error", e)
+
+    def test_request_review_creates_entry_and_full_flag(self):
+        self.state.prs.clear()
+        key = self.sized_bot().request_review("acme", "new-mfe", 3, full=True)
+        e = self.state.prs[key]
+        self.assertEqual((e["source"], e["force"], e["force_full"], e["note"]), ("manual", True, True, "review completa forçada pelo painel"))
+
+    def test_request_review_skips_debounce(self):
+        self.gh.changed_files = 3
+        bot = pr_bot.Bot({**CFG, "min_changed_files": 16, "review_debounce_minutes": 5}, self.gh, self.state, self.log, False)
+        bot.request_review("acme", "orders-mfe", 7)
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_called_once()
+
+    def test_existing_bot_review_is_adopted_instead_of_size_skip(self):
+        self.gh.changed_files = 3
+        self.gh.review_list = [{"id": 55, "user": "my-login", "state": "COMMENTED", "commit_id": H1, "body": f"x <!-- pr-autoapprove sha={H1} -->"}]
+        rc, files, diff = self.run_sized()
+        rc.assert_not_called()
+        self.assertEqual((self.entry()["status"], self.entry()["review_ids"]), ("REVIEWED", [55]))
+
+    def test_dry_run_does_not_adopt_before_size_skip(self):
+        self.gh.changed_files = 3
+        self.gh.review_list = [{"id": 55, "user": "my-login", "state": "COMMENTED", "commit_id": H1, "body": f"x <!-- pr-autoapprove sha={H1} -->"}]
+        bot = pr_bot.Bot({**CFG, "min_changed_files": 16}, self.gh, self.state, self.log, True)
+        self.run_sized(bot)
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+
+    def test_released_discovery_pr_is_retired_when_request_is_gone(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        self.gh.requested = {"users": [], "teams": []}
+        rc, _, _ = self.run_sized(self.sized_bot(10))
+        rc.assert_not_called()
+        self.assertNotIn(KEY, self.state.prs)
+        self.assertEqual(self.state.data["done"][0]["reason"], "not_requested")
+
+    def test_grown_discovery_pr_is_retired_when_request_is_gone(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        self.gh.requested = {"users": [], "teams": []}
+        self.gh.head, self.gh.changed_files = H2, 20
+        rc, _, _ = self.run_sized()
+        rc.assert_not_called()
+        self.assertNotIn(KEY, self.state.prs)
+
+    def test_released_discovery_pr_with_request_still_present_is_reviewed(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        rc, _, _ = self.run_sized(self.sized_bot(10))
+        rc.assert_called_once()
+
+    def test_other_skip_with_new_head_is_reviewed_without_rechecking_request(self):
+        self.entry().update(status="SKIPPED", skipped_sha=H1, skip_reason="nenhum arquivo revisável", head_sha=H1)
+        self.gh.requested = {"users": [], "teams": []}
+        self.gh.head = H2
+        with mock.patch.object(self.gh, "requested_reviewers", wraps=self.gh.requested_reviewers) as req:
+            rc, _, _ = self.run_sized(self.sized_bot(0))
+        rc.assert_called_once()
+        req.assert_not_called()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_request_is_rechecked_only_after_debounce_window(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        self.gh.head, self.gh.changed_files = H2, 20
+        bot = pr_bot.Bot({**CFG, "min_changed_files": 16, "review_debounce_minutes": 5}, self.gh, self.state, self.log, False)
+        with mock.patch.object(self.gh, "requested_reviewers", wraps=self.gh.requested_reviewers) as req:
+            rc, _, _ = self.run_sized(bot)
+            rc.assert_not_called()
+            req.assert_not_called()
+            self.age_head()
+            rc, _, _ = self.run_sized(bot)
+            req.assert_called_once()
+        rc.assert_called_once()
+
+    def test_still_small_pr_does_not_recheck_request(self):
+        self.gh.changed_files = 12
+        self.run_sized()
+        self.gh.requested = {"users": [], "teams": []}
+        rc, _, _ = self.run_sized()
+        rc.assert_not_called()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+
+    def test_skipped_pr_already_reviewed_by_the_bot_is_not_cut_by_size(self):
+        self.entry().update(status="SKIPPED", skipped_sha=H1, skip_reason="nenhum arquivo revisável", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head, self.gh.changed_files = H2, 2
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+
+    def test_command_line_pr_runs_through_run_and_reviews_small_pr(self):
+        self.gh.changed_files = 3
+        self.gh.login = lambda: "my-login"
+        self.entry().update(status="SKIPPED", skipped_sha=H1, skip_reason="x", skip_kind="min_changed_files")
+        self.state.save()
+        cfg = {**CFG, "min_changed_files": 16, "gh_path": "gh"}
+        with mock.patch.object(pr_bot, "Gh", return_value=self.gh), mock.patch("reviewer.run_claude", return_value=payload(H1)) as rc:
+            code = pr_bot.run(cfg, self.log, "live", False, "https://github.com/acme/orders-mfe/pull/7")
+        self.assertEqual(code, 0)
+        rc.assert_called_once()
+        saved = pr_bot.State(Path(self.tmp.name) / "state.json").prs[KEY]
+        self.assertEqual((saved["status"], saved["source"]), ("REVIEWED", "manual"))
+        self.assertEqual(saved["reviews"][0]["kind"], "full")
+
+    def test_command_line_pr_note_does_not_mention_panel(self):
+        self.gh.changed_files = 3
+        bot = self.sized_bot()
+        bot.request_review("acme", "orders-mfe", 7, via="pela linha de comando")
+        self.assertEqual(self.entry()["note"], "review pedido pela linha de comando")
+
+    def test_exactly_minimum_is_reviewed(self):
+        self.gh.changed_files = 16
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_skipped_pr_is_reevaluated_when_head_grows_past_minimum(self):
+        self.gh.changed_files = 15
+        self.run_sized()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+        self.gh.head, self.gh.changed_files = H2, 20
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_skipped_pr_with_new_head_still_small_stays_skipped(self):
+        self.gh.changed_files = 15
+        self.run_sized()
+        self.gh.head = H2
+        rc, _, _ = self.run_sized()
+        rc.assert_not_called()
+        self.reviews_spy.assert_not_called()
+        self.assertEqual(self.entry()["skipped_sha"], H2)
+
+    def test_grown_pr_respects_debounce(self):
+        self.gh.changed_files = 15
+        self.run_sized()
+        self.gh.head, self.gh.changed_files = H2, 20
+        bot = pr_bot.Bot({**CFG, "min_changed_files": 16, "review_debounce_minutes": 5}, self.gh, self.state, self.log, False)
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_not_called()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+        self.assertEqual(self.entry()["skipped_sha"], H1)
+        self.assertIn("esperando novos pushes", self.entry()["note"])
+
+    def test_panel_request_reviews_small_pr(self):
+        self.gh.changed_files = 3
+        self.drop_request(self.entry()["url"])
+        bot = self.sized_bot()
+        bot.ingest_inbox()
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["status"], "REVIEWED")
+
+    def test_panel_request_requeues_size_skipped_pr_and_reviews_it(self):
+        self.gh.changed_files = 3
+        self.run_sized()
+        self.assertEqual(self.entry()["status"], "SKIPPED")
+        self.drop_request(self.entry()["url"])
+        bot = self.sized_bot()
+        bot.ingest_inbox()
+        rc, _, _ = self.run_sized(bot)
+        rc.assert_called_once()
+
+    def test_manual_source_without_force_reviews_small_pr(self):
+        self.gh.changed_files = 3
+        self.entry()["source"] = "manual"
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+
+    def test_reviewed_small_pr_gets_delta_review_on_new_head(self):
+        self.entry().update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head, self.gh.changed_files = H2, 2
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+        self.assertEqual(self.entry()["reviewed_sha"], H2)
+
+    def test_approved_small_pr_gets_delta_review_on_new_head(self):
+        self.entry().update(status="APPROVED", approved_sha=H1, reviewed_sha=H1, review_ids=[101], head_sha=H1)
+        self.gh.head, self.gh.changed_files = H2, 2
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+
+    def test_forced_full_review_on_reviewed_small_pr_is_not_cut(self):
+        self.entry().update(status="REVIEWED", reviewed_sha=H1, review_ids=[101], head_sha=H1, force=True, force_full=True)
+        self.gh.changed_files = 2
+        rc, _, _ = self.run_sized()
+        rc.assert_called_once()
+
+    def test_zero_disables_the_filter(self):
+        self.gh.changed_files = 1
+        rc, _, _ = self.run_sized(self.sized_bot(0))
+        rc.assert_called_once()
+
+    def test_missing_or_invalid_count_does_not_cut(self):
+        for value in (None, "15", True):
+            with self.subTest(value=value):
+                self.state.prs[KEY] = pr_bot.new_entry("acme", "orders-mfe", 7, "https://github.com/acme/orders-mfe/pull/7")
+                self.gh.changed_files = value
+                self.gh.review_list = []
+                rc, _, _ = self.run_sized()
+                rc.assert_called_once()
 
 
 if __name__ == "__main__":

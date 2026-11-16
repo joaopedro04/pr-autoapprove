@@ -25,6 +25,7 @@ RUNS_KEEP_DAYS = 7
 DONE_KEEP = 30
 REVIEWS_KEEP = 20
 REVIEW_ACTIONS = ("full_review", "delta_review")
+MIN_FILES_SKIP = "min_changed_files"
 LABEL_ATTEMPTS = 3
 SAVE_ATTEMPTS = 40
 SAVE_RETRY_SECONDS = 0.05
@@ -155,6 +156,9 @@ class Bot:
         self.claude_down = None
 
     def save(self):
+        for entry in self.state.prs.values():
+            if entry["status"] != "SKIPPED":
+                entry.pop("skip_kind", None)
         self.state.save()
 
     def note(self, key, entry, msg, level=logging.INFO):
@@ -203,28 +207,31 @@ class Bot:
                 self.log.warning("pedido inválido no inbox: %r", request)
                 continue
             owner, repo, n = parsed
-            key = f"{owner}/{repo}#{n}"
-            entry = self.state.prs.get(key)
-            if entry is None:
-                entry = self.state.prs[key] = new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual")
-                msg = "adicionado pelo painel"
-            elif entry["status"] in ("ERROR", "SKIPPED"):
-                entry.update(status="NEW", failures=0, source="manual")
-                for stale in ("last_error", "skipped_sha", "skip_reason"):
-                    entry.pop(stale, None)
-                msg = "reenfileirado pelo painel"
-            else:
-                entry["source"] = "manual"
-                msg = "review pedido pelo painel"
-            entry["force"] = True
-            if request.get("full"):
-                entry["force_full"] = True
-                msg = "review completa forçada pelo painel"
-            self.note(key, entry, msg)
-            added.append(key)
+            added.append(self.request_review(owner, repo, n, full=bool(request.get("full"))))
         if added:
             self.save()
         return added
+
+    def request_review(self, owner, repo, n, full=False, via="pelo painel"):
+        key = f"{owner}/{repo}#{n}"
+        entry = self.state.prs.get(key)
+        if entry is None:
+            entry = self.state.prs[key] = new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual")
+            msg = f"adicionado {via}"
+        elif entry["status"] in ("ERROR", "SKIPPED"):
+            entry.update(status="NEW", failures=0, source="manual")
+            for stale in ("last_error", "skipped_sha", "skip_reason", "skip_kind"):
+                entry.pop(stale, None)
+            msg = f"reenfileirado {via}"
+        else:
+            entry["source"] = "manual"
+            msg = f"review pedido {via}"
+        entry["force"] = True
+        if full:
+            entry["force_full"] = True
+            msg = f"review completa forçada {via}"
+        self.note(key, entry, msg)
+        return key
 
     def discover(self):
         org = self.cfg["org"]
@@ -309,20 +316,57 @@ class Bot:
             and entry.get("source", "discovery") == "discovery"
             and not self.is_requested(owner, repo, n)
         ):
-            return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
+            return self.retire_not_requested(key, entry)
         if entry.get("reviewed_sha"):
             self.apply_labels(key, entry, pr)
         forced = bool(entry.get("force"))
         action = "full_review" if entry.get("force_full") and entry["status"] != "ERROR" else gate.next_action(entry, head)
+        was_size_skipped = entry["status"] == "SKIPPED" and entry.get("skip_kind") == MIN_FILES_SKIP
+        small = self.below_minimum(entry, pr, forced)
+        if entry["status"] == "SKIPPED" and entry.get("skip_kind") == MIN_FILES_SKIP and action == "skip" and not small:
+            action = "full_review"
+        if small and action == "full_review" and entry["status"] in ("NEW", "SKIPPED"):
+            if entry["status"] == "NEW" and not self.dry_run and self.adopt_existing_review(key, entry):
+                action = gate.next_action(entry, head)
+            else:
+                return self.skip(
+                    key, entry, head, f"{pr['changedFiles']} arquivos alterados, abaixo do mínimo de {self.cfg['min_changed_files']}", MIN_FILES_SKIP
+                )
         if action in REVIEW_ACTIONS and not forced and not gate.settled(entry, self.cfg["review_debounce_minutes"]):
             return self.note(key, entry, f"head {head[:7]} mudou há menos de {self.cfg['review_debounce_minutes']} min, esperando novos pushes antes de revisar")
+        if (
+            was_size_skipped
+            and action == "full_review"
+            and entry.get("source", "discovery") == "discovery"
+            and not entry.get("reviewed_sha")
+            and not entry.get("review_ids")
+            and not self.is_requested(owner, repo, n)
+        ):
+            return self.retire_not_requested(key, entry)
         candidate = Candidate(key, entry, pr, action, forced, len(entry.get("reviews", [])))
         if action in REVIEW_ACTIONS:
             return candidate
         if forced:
-            self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head (use Forçar review para revisar de novo)")
+            self.note(key, entry, f"nada novo para revisar em {head[:7]}: o bot já revisou este head (peça uma review completa forçada pelo painel para revisar de novo)")
         self.after_action(candidate)
         return None
+
+    def retire_not_requested(self, key, entry):
+        return self.retire(key, entry, "not_requested", f"review não está mais pedido a {self.login} nem aos times {self.cfg['review_teams']}, saiu da fila")
+
+    def below_minimum(self, entry, pr, forced):
+        minimum = self.cfg["min_changed_files"]
+        changed = pr.get("changedFiles")
+        return (
+            minimum > 0
+            and not forced
+            and not entry.get("reviewed_sha")
+            and not entry.get("review_ids")
+            and entry.get("source") != "manual"
+            and isinstance(changed, int)
+            and not isinstance(changed, bool)
+            and changed < minimum
+        )
 
     def apply_labels(self, key, entry, pr):
         wanted = self.cfg.get("pr_labels") or []
@@ -391,8 +435,11 @@ class Bot:
             "REPO": entry["repo"], "NUMBER": str(entry["number"]), "HEAD_SHA": head, "HEAD_SHA7": head[:7],
         }
 
-    def skip(self, key, entry, head, reason):
+    def skip(self, key, entry, head, reason, kind=None):
+        entry.pop("skip_kind", None)
         entry.update(status="SKIPPED", skipped_sha=head, skip_reason=reason)
+        if kind:
+            entry["skip_kind"] = kind
         self.note(key, entry, f"ignorado em {head[:7]} ({reason})")
 
     def adopt_existing_review(self, key, entry):
@@ -645,8 +692,8 @@ def run(cfg, log, mode, dry_run, pr_url):
                 log.error("URL de PR inválida: %s", pr_url)
                 return 2
             owner, repo, n = m.group(1), m.group(2), int(m.group(3))
-            key = f"{owner}/{repo}#{n}"
-            state.prs.setdefault(key, new_entry(owner, repo, n, f"https://github.com/{owner}/{repo}/pull/{n}", "manual"))
+            key = bot.request_review(owner, repo, n, via="pela linha de comando")
+            bot.save()
             bot.process_all(keys=[key])
         else:
             bot.ingest_inbox()

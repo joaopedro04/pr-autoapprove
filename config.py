@@ -84,6 +84,7 @@ SPEC = {
     "max_reviews_per_run": ("MAX_REVIEWS_PER_RUN", "6", int),
     "review_concurrency": ("REVIEW_CONCURRENCY", "3", int),
     "max_failures": ("MAX_FAILURES", "3", int),
+    "min_changed_files": ("MIN_CHANGED_FILES", "0", int),
     "settle_minutes": ("SETTLE_MINUTES", "10", int),
     "review_debounce_minutes": ("REVIEW_DEBOUNCE_MINUTES", "5", int),
     "schedule_interval_minutes": ("SCHEDULE_INTERVAL_MINUTES", "5", int),
@@ -124,6 +125,8 @@ def load_config(env_file=None, environ=None):
         raise ConfigError(f"faltam no .env: {', '.join(missing)}")
     if cfg["review_concurrency"] < 1:
         raise ConfigError("REVIEW_CONCURRENCY precisa ser 1 ou mais")
+    if cfg["min_changed_files"] < 0:
+        raise ConfigError("MIN_CHANGED_FILES não pode ser negativo")
     if cfg["mode"] not in MODES:
         raise ConfigError(f"BOT_MODE precisa ser um de {MODES}, veio {cfg['mode']!r}")
     return cfg

@@ -9,7 +9,7 @@ O agendador do sistema (Agendador do Windows, systemd no Linux ou launchd no mac
 
 ## Como funciona
 
-1. **Descoberta.** Busca PRs abertos da `GITHUB_ORG` com review pedido ao `GITHUB_LOGIN` **direto** ou a um dos `REVIEW_TEAMS`, em repos cujo nome termina com um dos `REPO_SUFFIXES`. Ficam de fora draft, dependabot, PR do próprio login e PR criado antes de `ACTIVE_SINCE`. Antes da primeira review, o bot confere de novo o pedido; se ele sumiu, o PR sai da fila.
+1. **Descoberta.** Busca PRs abertos da `GITHUB_ORG` com review pedido ao `GITHUB_LOGIN` **direto** ou a um dos `REVIEW_TEAMS`, em repos cujo nome termina com um dos `REPO_SUFFIXES`. Ficam de fora draft, dependabot, PR do próprio login e PR criado antes de `ACTIVE_SINCE`. Antes da primeira review, o bot confere de novo o pedido; se ele sumiu, o PR sai da fila. Com `MIN_CHANGED_FILES` maior que 0, a primeira review só acontece em PR com essa quantidade de arquivos alterados ou mais; os menores ficam como ignorados e são reavaliados a cada push ou quando o mínimo muda. Pedido manual (painel ou `--pr`) e PR já revisado não passam por esse corte.
 2. **Review completa.** Baixa diff, `package.json`, `angular.json` e a árvore do head. Depois roda `claude -p` com a `REVIEW_SKILL`, sem Bash, sem Write e sem MCP. O Claude devolve o payload e o bot valida: só `COMMENT`, `commit_id` igual ao head, âncoras no diff, no máximo 30 inline. Quem posta é o bot.
 
    Até `REVIEW_CONCURRENCY` reviews rodam em paralelo, com teto de `MAX_REVIEWS_PER_RUN` por execução. Só os `claude -p` rodam em threads; ler o GitHub, postar, resolver thread, aprovar e salvar o estado acontecem numa linha só. Cada review é preparada quando abre uma vaga, com o head mais recente. Se o head mudar durante a review, o bot não roda o gate naquele momento e deixa o delta para a próxima execução.
@@ -143,13 +143,13 @@ python dashboard.py --open
 | Ligar de verdade | `BOT_MODE=live` |
 | Pausar | `BOT_MODE=off` (ou `dry-run`) |
 | Mudar o intervalo | `SCHEDULE_INTERVAL_MINUTES` no `.env` e rodar o instalador de novo: `install_task.ps1` (Windows) ou `bash install.sh` (Linux/macOS) |
-| Um PR só, agora | `python pr_bot.py --pr <url>` (com `--dry-run` para não postar) |
+| Um PR só, agora | `python pr_bot.py --pr <url>` (com `--dry-run` para não postar); entra na frente, pula o debounce e reabre PR em `ERROR` ou ignorado |
 | Remover as tarefas (bot e painel) | Windows: `powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall`. Linux/macOS: `bash install.sh --uninstall` |
 | Painel | `http://127.0.0.1:8765/` (log em `logs/dashboard.log`) |
 | Logs | `logs/AAAA-MM-DD.log` |
 | Insumos e saída de cada review | `runs/<repo>-<n>-<sha7>-<full\|delta>/` (apagados após 7 dias) |
 | Estado | `state.json` (live) e `state.dry-run.json` (dry-run) |
-| Destravar PR em `ERROR` | apagar a entrada do PR no arquivo de estado |
+| Destravar PR em `ERROR` | `python pr_bot.py --pr <url>` ou o campo do painel |
 | Ignorar check flaky | `IGNORE_CHECKS=repo:Nome do check;outro-repo:Outro` |
 
 Variáveis de ambiente do sistema têm precedência sobre o `.env`.
